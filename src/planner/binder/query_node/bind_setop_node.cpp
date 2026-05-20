@@ -15,6 +15,21 @@
 
 namespace duckdb {
 
+static bool ContainsResultDB(QueryNode &node) {
+	if (node.type == QueryNodeType::SELECT_NODE) {
+		return node.Cast<SelectNode>().resultdb;
+	}
+	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+		auto &setop = node.Cast<SetOperationNode>();
+		for (auto &child : setop.children) {
+			if (ContainsResultDB(*child)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 struct SetOpAliasGatherer {
 public:
 	explicit SetOpAliasGatherer(SelectBindState &bind_state_p) : bind_state(bind_state_p) {
@@ -251,6 +266,9 @@ BoundStatement Binder::BindNode(SetOperationNode &statement) {
 		throw InternalException("Set Operation type must have exactly 2 children - except for UNION/UNION_BY_NAME");
 	}
 	for (auto &child : statement.children) {
+		if (ContainsResultDB(*child)) {
+			throw BinderException("RESULTDB cannot currently be used with set operations");
+		}
 		auto child_binder = Binder::CreateBinder(context, this);
 		child_binder->can_contain_nulls = true;
 		auto child_node = child_binder->BindNode(*child);

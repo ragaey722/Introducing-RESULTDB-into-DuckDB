@@ -33,6 +33,85 @@
 
 namespace duckdb {
 
+struct ResultDBColumnBindInfo {
+	//! Position of the selected column in the flat projection that DuckDB will execute normally.
+	idx_t flat_column_index;
+	//! Bound table alias that owns this selected column.
+	string table_name;
+};
+
+static void CheckResultDBSupported(const SelectNode &statement) {
+	if (!statement.resultdb) {
+		return;
+	}
+	if (!statement.modifiers.empty()) {
+		throw BinderException("RESULTDB does not currently support ORDER BY, LIMIT, OFFSET, or DISTINCT");
+	}
+	if (!statement.groups.group_expressions.empty() || !statement.groups.grouping_sets.empty() ||
+	    statement.aggregate_handling != AggregateHandling::STANDARD_HANDLING || statement.having || statement.qualify) {
+		throw BinderException("RESULTDB currently supports only row-preserving SELECT queries");
+	}
+}
+
+static void CheckResultDBTableRefsSupported(const TableRef &ref) {
+	if (ref.type != TableReferenceType::JOIN) {
+		return;
+	}
+
+	auto &join = ref.Cast<JoinRef>();
+	// Outer joins can synthesize NULL-extended rows that do not correspond to real source rows.
+	if (join.type != JoinType::INNER) {
+		throw BinderException("RESULTDB currently supports only INNER joins");
+	}
+	CheckResultDBTableRefsSupported(*join.left);
+	CheckResultDBTableRefsSupported(*join.right);
+}
+
+static void AddResultDBColumn(vector<ResultDBColumnBindInfo> &resultdb_columns, unique_ptr<ParsedExpression> &expr,
+                              idx_t flat_column_index) {
+	if (expr->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		throw BinderException(expr->GetQueryLocation(), "RESULTDB select list can only contain source columns, "
+		                                               "* expansions, or table.* expansions");
+	}
+	auto &colref = expr->Cast<ColumnRefExpression>();
+	if (!colref.IsQualified()) {
+		throw BinderException(expr->GetQueryLocation(), "RESULTDB could not resolve the source table for column \"%s\"",
+		                      colref.GetColumnName());
+	}
+	ResultDBColumnBindInfo info;
+	info.flat_column_index = flat_column_index;
+	info.table_name = colref.GetTableName();
+	resultdb_columns.push_back(std::move(info));
+}
+
+static vector<ResultDBTableMetadata> BuildResultDBTables(const vector<ResultDBColumnBindInfo> &resultdb_columns,
+                                                         const vector<string> &names,
+                                                         const vector<LogicalType> &types) {
+	vector<ResultDBTableMetadata> tables;
+	case_insensitive_map_t<idx_t> table_map;
+	for (auto &column_info : resultdb_columns) {
+		D_ASSERT(column_info.flat_column_index < names.size());
+		D_ASSERT(column_info.flat_column_index < types.size());
+		auto entry = table_map.find(column_info.table_name);
+		idx_t table_index;
+		if (entry == table_map.end()) {
+			table_index = tables.size();
+			table_map[column_info.table_name] = table_index;
+			ResultDBTableMetadata table;
+			table.name = column_info.table_name;
+			tables.push_back(std::move(table));
+		} else {
+			table_index = entry->second;
+		}
+		ResultDBColumnMetadata column;
+		column.flat_column_index = column_info.flat_column_index;
+		column.name = names[column_info.flat_column_index];
+		column.type = types[column_info.flat_column_index];
+		tables[table_index].columns.push_back(std::move(column));
+	}
+	return tables;
+}
+
 unique_ptr<Expression> Binder::BindOrderExpression(OrderBinder &order_binder, unique_ptr<ParsedExpression> expr) {
 	// we treat the distinct list as an ORDER BY
 	auto bound_expr = order_binder.Bind(std::move(expr));
@@ -383,6 +462,12 @@ void Binder::BindModifiers(BoundQueryNode &result, TableIndex table_index, const
 
 BoundStatement Binder::BindNode(SelectNode &statement) {
 	D_ASSERT(statement.from_table);
+	if (statement.resultdb && statement.from_table->type == TableReferenceType::EMPTY_FROM) {
+		throw BinderException("RESULTDB requires a FROM clause");
+	}
+	if (statement.resultdb) {
+		CheckResultDBTableRefsSupported(*statement.from_table);
+	}
 
 	// first bind the FROM table statement
 	auto from = std::move(statement.from_table);
@@ -422,6 +507,7 @@ void Binder::BindWhereStarExpression(unique_ptr<ParsedExpression> &expr) {
 }
 
 BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from_table) {
+	CheckResultDBSupported(statement);
 	D_ASSERT(from_table.plan);
 	D_ASSERT(!statement.from_table);
 	auto result_ptr = make_uniq<BoundSelectNode>();
@@ -449,10 +535,16 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 	statement.select_list = std::move(new_select_list);
 
 	auto &bind_state = result.bind_state;
+	vector<ResultDBColumnBindInfo> resultdb_columns;
 	for (idx_t i = 0; i < statement.select_list.size(); i++) {
 		auto &expr = statement.select_list[i];
 		result.names.push_back(expr->GetName());
+		// ResultDB needs the table alias for each selected column so the collector can
+		// group flat output columns back into per-table results.
 		ExpressionBinder::QualifyColumnNames(*this, expr);
+		if (statement.resultdb) {
+			AddResultDBColumn(resultdb_columns, expr, i);
+		}
 		if (!expr->GetAlias().empty()) {
 			bind_state.alias_map[expr->GetAlias()] = i;
 			result.names[i] = expr->GetAlias();
@@ -581,6 +673,9 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 		result.bound_column_count++;
 
 		if (expr->GetExpressionType() == ExpressionType::BOUND_EXPANDED) {
+			if (statement.resultdb) {
+				throw BinderException("RESULTDB does not currently support struct expansion in the select list");
+			}
 			if (!is_original_column) {
 				throw BinderException("UNNEST of struct cannot be used in ORDER BY/DISTINCT ON clause");
 			}
@@ -658,6 +753,14 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 	result.column_count = new_names.size();
 	result.names = std::move(new_names);
 	result.need_prune = result.select_list.size() > result.column_count;
+	if (statement.resultdb) {
+		D_ASSERT(resultdb_columns.size() == result.names.size());
+		auto &properties = GetStatementProperties();
+		// Decomposition needs the complete flat result before any per-table result can be returned.
+		properties.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+		properties.resultdb.enabled = true;
+		properties.resultdb.tables = BuildResultDBTables(resultdb_columns, result.names, result.types);
+	}
 
 	// in the normal select binder, we bind columns as if there is no aggregation
 	// i.e. in the query [SELECT i, SUM(i) FROM integers;] the "i" will be bound as a normal column

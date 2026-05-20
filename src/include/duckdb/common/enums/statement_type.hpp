@@ -10,6 +10,7 @@
 
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
@@ -66,6 +67,28 @@ string StatementReturnTypeToString(StatementReturnType type);
 class Catalog;
 class ClientContext;
 
+//! Metadata that lets the result collector split a flat SELECT RESULTDB result
+//! back into separate per-table results.
+struct ResultDBColumnMetadata {
+	//! Position of this column in the normal flat SELECT output before decomposition.
+	idx_t flat_column_index;
+	string name;
+	LogicalType type;
+};
+
+struct ResultDBTableMetadata {
+	//! Table alias used in the SELECT query.
+	string name;
+	//! Output columns selected for this table, in table-local output order.
+	vector<ResultDBColumnMetadata> columns;
+};
+
+struct ResultDBProperties {
+	bool enabled = false;
+	//! Tables to return after decomposing the flat SELECT result, in output order.
+	vector<ResultDBTableMetadata> tables;
+};
+
 //! A struct containing various properties of a SQL statement
 struct StatementProperties {
 	StatementProperties()
@@ -101,6 +124,8 @@ struct StatementProperties {
 	bool requires_valid_transaction;
 	//! Whether or not the result can be streamed to the client
 	QueryResultOutputType output_type;
+	//! SELECT RESULTDB metadata produced by the binder and consumed by the result collector for decomposition
+	ResultDBProperties resultdb;
 	//! Whether or not all parameters have successfully had their types determined
 	bool bound_all_parameters;
 	//! What type of data the statement returns
