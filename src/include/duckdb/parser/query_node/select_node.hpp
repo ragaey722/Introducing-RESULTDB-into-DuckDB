@@ -27,6 +27,8 @@ public:
 
 	//! The projection list
 	vector<unique_ptr<ParsedExpression>> select_list;
+	//! Whether this SELECT should return a ResultDB relation set
+	bool resultdb = false;
 	//! The FROM clause
 	unique_ptr<TableRef> from_table;
 	//! The WHERE clause

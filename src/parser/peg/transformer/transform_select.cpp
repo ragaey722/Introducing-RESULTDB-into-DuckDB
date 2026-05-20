@@ -288,6 +288,24 @@ unique_ptr<TableRef> PEGTransformerFactory::TransformFromClause(PEGTransformer &
 unique_ptr<SelectNode> PEGTransformerFactory::TransformSelectClause(PEGTransformer &transformer,
                                                                     ParseResult &parse_result) {
 	auto &list_pr = parse_result.Cast<ListParseResult>();
+	return transformer.Transform<unique_ptr<SelectNode>>(list_pr.Child<ChoiceParseResult>(0).GetResult());
+}
+
+unique_ptr<SelectNode> PEGTransformerFactory::TransformResultDBSelectClause(PEGTransformer &transformer,
+                                                                            ParseResult &parse_result) {
+	auto &list_pr = parse_result.Cast<ListParseResult>();
+	auto result = make_uniq<SelectNode>();
+	result->resultdb = true;
+	auto target_list = transformer.Transform<vector<unique_ptr<ParsedExpression>>>(list_pr.Child<ListParseResult>(2));
+	for (auto &expr_ptr : target_list) {
+		result->select_list.push_back(std::move(expr_ptr));
+	}
+	return result;
+}
+
+unique_ptr<SelectNode> PEGTransformerFactory::TransformRegularSelectClause(PEGTransformer &transformer,
+                                                                           ParseResult &parse_result) {
+	auto &list_pr = parse_result.Cast<ListParseResult>();
 	auto result = make_uniq<SelectNode>();
 	auto &opt_distinct = list_pr.Child<OptionalParseResult>(1);
 	if (opt_distinct.HasResult()) {

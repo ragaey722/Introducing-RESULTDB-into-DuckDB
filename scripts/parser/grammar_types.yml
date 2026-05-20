@@ -121,6 +121,8 @@ SelectNode:
     - SelectFromClause
     - FromSelectClause
     - SelectClause
+    - ResultDBSelectClause
+    - RegularSelectClause
 
 SetOperationNode:
   type: "unique_ptr<SetOperationNode>"

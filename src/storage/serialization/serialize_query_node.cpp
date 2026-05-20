@@ -155,6 +155,7 @@ void SelectNode::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<unique_ptr<ParsedExpression>>(206, "having", having);
 	serializer.WritePropertyWithDefault<unique_ptr<SampleOptions>>(207, "sample", sample);
 	serializer.WritePropertyWithDefault<unique_ptr<ParsedExpression>>(208, "qualify", qualify);
+	serializer.WritePropertyWithDefault<bool>(209, "resultdb", resultdb, false);
 }
 
 unique_ptr<QueryNode> SelectNode::Deserialize(Deserializer &deserializer) {
@@ -168,6 +169,7 @@ unique_ptr<QueryNode> SelectNode::Deserialize(Deserializer &deserializer) {
 	deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(206, "having", result->having);
 	deserializer.ReadPropertyWithDefault<unique_ptr<SampleOptions>>(207, "sample", result->sample);
 	deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(208, "qualify", result->qualify);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(209, "resultdb", result->resultdb, false);
 	return std::move(result);
 }
 

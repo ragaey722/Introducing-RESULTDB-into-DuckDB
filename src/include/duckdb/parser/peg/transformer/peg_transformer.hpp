@@ -1019,6 +1019,10 @@ private:
 	static unique_ptr<SelectNode> TransformFromSelectClause(PEGTransformer &transformer, ParseResult &parse_result);
 	static unique_ptr<TableRef> TransformFromClause(PEGTransformer &transformer, ParseResult &parse_result);
 	static unique_ptr<SelectNode> TransformSelectClause(PEGTransformer &transformer, ParseResult &parse_result);
+	static unique_ptr<SelectNode> TransformResultDBSelectClause(PEGTransformer &transformer,
+	                                                            ParseResult &parse_result);
+	static unique_ptr<SelectNode> TransformRegularSelectClause(PEGTransformer &transformer,
+	                                                           ParseResult &parse_result);
 	static DistinctClause TransformDistinctClause(PEGTransformer &transformer, ParseResult &parse_result);
 	static DistinctClause TransformDistinctOn(PEGTransformer &transformer, ParseResult &parse_result);
 	static vector<unique_ptr<ParsedExpression>> TransformDistinctOnTargets(PEGTransformer &transformer,

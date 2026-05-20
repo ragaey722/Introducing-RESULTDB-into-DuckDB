@@ -16,6 +16,9 @@ string SelectNode::ToString() const {
 	string result;
 	result = cte_map.ToString();
 	result += "SELECT ";
+	if (resultdb) {
+		result += "RESULTDB ";
+	}
 
 	// search for a distinct modifier
 	for (idx_t modifier_idx = 0; modifier_idx < modifiers.size(); modifier_idx++) {
@@ -118,6 +121,9 @@ bool SelectNode::Equals(const QueryNode *other_p) const {
 	auto &other = other_p->Cast<SelectNode>();
 
 	// SELECT
+	if (resultdb != other.resultdb) {
+		return false;
+	}
 	if (!ExpressionUtil::ListEquals(select_list, other.select_list)) {
 		return false;
 	}
@@ -152,6 +158,7 @@ bool SelectNode::Equals(const QueryNode *other_p) const {
 
 unique_ptr<QueryNode> SelectNode::Copy() const {
 	auto result = make_uniq<SelectNode>();
+	result->resultdb = resultdb;
 	for (auto &child : select_list) {
 		result->select_list.push_back(child->Copy());
 	}

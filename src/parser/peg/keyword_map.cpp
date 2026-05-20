@@ -64,6 +64,7 @@ void PEGKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	reserved_keyword_map.insert("primary");
 	reserved_keyword_map.insert("qualify");
 	reserved_keyword_map.insert("references");
+	reserved_keyword_map.insert("resultdb");
 	reserved_keyword_map.insert("returning");
 	reserved_keyword_map.insert("select");
 	reserved_keyword_map.insert("show");
