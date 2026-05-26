@@ -195,25 +195,36 @@ RenderingResultIterator RenderingQueryResult::end() {
 
 SuccessState ShellState::RenderQueryResult(ShellRenderer &renderer, duckdb::QueryResult &query_result,
                                            PagerMode pager_overwrite) {
-	RenderingQueryResult render_result(query_result, renderer);
-	renderer.Analyze(render_result);
-	if (seenInterrupt) {
-		return SuccessState::FAILURE;
-	}
-
-	// check if we need to use the pager for the rendering
-	unique_ptr<PagerState> pager_setup;
-	if (pager_overwrite == PagerMode::PAGER_AUTOMATIC) {
-		if (ShouldUsePager(renderer, render_result)) {
-			pager_overwrite = PagerMode::PAGER_ON;
+	// Some statements, such as SELECT RESULTDB, return several QueryResult objects linked
+	// through QueryResult::next. Render every result in that chain.
+	auto current_result = optional_ptr<duckdb::QueryResult>(&query_result);
+	while (current_result) {
+		RenderingQueryResult render_result(*current_result, renderer);
+		renderer.Analyze(render_result);
+		if (seenInterrupt) {
+			return SuccessState::FAILURE;
 		}
+
+		// check if we need to use the pager for the rendering
+		auto current_pager_mode = pager_overwrite;
+		unique_ptr<PagerState> pager_setup;
+		if (current_pager_mode == PagerMode::PAGER_AUTOMATIC) {
+			if (ShouldUsePager(renderer, render_result)) {
+				current_pager_mode = PagerMode::PAGER_ON;
+			}
+		}
+		if (current_pager_mode == PagerMode::PAGER_ON) {
+			pager_setup = SetupPager();
+		}
+		// render the query result
+		PrintStream print_stream(*this);
+		auto render_state = renderer.RenderQueryResult(print_stream, *this, render_result);
+		if (render_state == SuccessState::FAILURE) {
+			return render_state;
+		}
+		current_result = current_result->next.get();
 	}
-	if (pager_overwrite == PagerMode::PAGER_ON) {
-		pager_setup = SetupPager();
-	}
-	// render the query result
-	PrintStream print_stream(*this);
-	return renderer.RenderQueryResult(print_stream, *this, render_result);
+	return SuccessState::SUCCESS;
 }
 
 SuccessState ShellRenderer::RenderQueryResult(PrintStream &out, ShellState &state, RenderingQueryResult &result) {
@@ -344,6 +355,10 @@ bool RenderingQueryResult::TryConvertChunk() {
 
 void ColumnRenderer::Analyze(RenderingQueryResult &result) {
 	auto &state = ShellState::Get();
+	// Renderers are reused across linked results, so per-column layout state must
+	// be recomputed for each table.
+	column_width.clear();
+	right_align.clear();
 	for (auto &column_name : result.metadata.column_names) {
 		column_name = ConvertValue(column_name.c_str(), column_name.size());
 	}

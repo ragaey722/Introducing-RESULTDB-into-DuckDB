@@ -3,13 +3,47 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
 using namespace duckdb;
+
+static vector<string> ResultRows(QueryResult &result) {
+	auto &materialized = result.Cast<MaterializedQueryResult>();
+	vector<string> rows;
+	for (idx_t row_idx = 0; row_idx < materialized.RowCount(); row_idx++) {
+		string row;
+		for (idx_t col_idx = 0; col_idx < result.ColumnCount(); col_idx++) {
+			if (col_idx > 0) {
+				row += "|";
+			}
+			row += materialized.GetValue(col_idx, row_idx).ToString();
+		}
+		rows.push_back(std::move(row));
+	}
+	std::sort(rows.begin(), rows.end());
+	return rows;
+}
+
+static void RequireResultDBTable(QueryResult &actual, const string &table_name, QueryResult &expected) {
+	REQUIRE(actual.properties.resultdb.enabled);
+	REQUIRE(actual.properties.resultdb.tables.size() == 1);
+	auto &table = actual.properties.resultdb.tables[0];
+	REQUIRE(table.name == table_name);
+	REQUIRE(table.columns.size() == actual.ColumnCount());
+	for (idx_t column_idx = 0; column_idx < table.columns.size(); column_idx++) {
+		REQUIRE(table.columns[column_idx].flat_column_index == column_idx);
+		REQUIRE(table.columns[column_idx].name == actual.names[column_idx]);
+		REQUIRE(table.columns[column_idx].type == actual.types[column_idx]);
+	}
+	REQUIRE(actual.names == expected.names);
+	REQUIRE(ResultRows(actual) == ResultRows(expected));
+}
 
 TEST_CASE("Test comment in CPP API", "[api]") {
 	DuckDB db(nullptr);
@@ -233,6 +267,226 @@ TEST_CASE("Test multiple result sets", "[api]") {
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 	result = std::move(result->next);
 	REQUIRE(CHECK_COLUMN(result, 0, {84}));
+	REQUIRE(!result->next);
+}
+
+TEST_CASE("Test ResultDB query returns source relations", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE customers(id INTEGER, name VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE orders(id INTEGER, customer_id INTEGER, amount INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO customers VALUES (1, 'Ada'), (2, 'Linus')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO orders VALUES (10, 1, 100), (11, 1, 200), (12, 2, 50)"));
+
+	duckdb::unique_ptr<QueryResult> result =
+	    con.Query("SELECT RESULTDB * FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount > 150");
+	REQUIRE(!result->HasError());
+	REQUIRE(result->properties.resultdb.enabled);
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "c");
+	REQUIRE(result->names == vector<string> {"id", "name"});
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE(CHECK_COLUMN(result, 1, {"Ada"}));
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	REQUIRE(result->properties.resultdb.enabled);
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "o");
+	REQUIRE(result->names == vector<string> {"id", "customer_id", "amount"});
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	REQUIRE(CHECK_COLUMN(result, 0, {11}));
+	REQUIRE(CHECK_COLUMN(result, 1, {1}));
+	REQUIRE(CHECK_COLUMN(result, 2, {200}));
+	REQUIRE(!result->next);
+
+	result = con.Query("SELECT RESULTDB c.name, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id "
+	                   "WHERE o.amount > 150");
+	REQUIRE(!result->HasError());
+	REQUIRE(result->properties.resultdb.enabled);
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "c");
+	REQUIRE(result->names == vector<string> {"name"});
+	REQUIRE(CHECK_COLUMN(result, 0, {"Ada"}));
+	result = std::move(result->next);
+	REQUIRE(result);
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "o");
+	REQUIRE(result->names == vector<string> {"amount"});
+	REQUIRE(CHECK_COLUMN(result, 0, {200}));
+	REQUIRE(!result->next);
+
+	result = con.Query("SELECT RESULTDB c.name, c.id FROM customers c WHERE c.id = 1");
+	REQUIRE(!result->HasError());
+	REQUIRE(result->properties.resultdb.enabled);
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "c");
+	REQUIRE(result->names == vector<string> {"name", "id"});
+	REQUIRE(CHECK_COLUMN(result, 0, {"Ada"}));
+	REQUIRE(CHECK_COLUMN(result, 1, {1}));
+	REQUIRE(!result->next);
+
+	result = con.Query("SELECT RESULTDB o.* FROM customers c JOIN orders o ON c.id = o.customer_id "
+	                   "WHERE o.amount > 150");
+	REQUIRE(!result->HasError());
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "o");
+	REQUIRE(result->names == vector<string> {"id", "customer_id", "amount"});
+	REQUIRE(CHECK_COLUMN(result, 0, {11}));
+	REQUIRE(!result->next);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE shipments(id INTEGER, order_id INTEGER, carrier VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO customers VALUES (3, 'Grace')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO orders VALUES (13, 3, 300), (14, 2, 75)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO shipments VALUES (100, 11, 'DHL'), (101, 13, 'UPS'), (102, 14, 'DHL')"));
+
+	const string three_table_from =
+	    " FROM customers c "
+	    "JOIN orders o ON c.id = o.customer_id "
+	    "JOIN shipments s ON o.id = s.order_id "
+	    "WHERE o.amount > 150";
+
+	result = con.Query("SELECT RESULTDB c.name, o.amount, s.carrier" + three_table_from);
+	REQUIRE(!result->HasError());
+	REQUIRE(result->properties.resultdb.enabled);
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "c");
+	REQUIRE(result->names == vector<string> {"name"});
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+	REQUIRE(CHECK_COLUMN(result, 0, {"Ada", "Grace"}));
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	REQUIRE(result->properties.resultdb.enabled);
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "o");
+	REQUIRE(result->names == vector<string> {"amount"});
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+	REQUIRE(CHECK_COLUMN(result, 0, {200, 300}));
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	REQUIRE(result->properties.resultdb.enabled);
+	REQUIRE(result->properties.resultdb.tables.size() == 1);
+	REQUIRE(result->properties.resultdb.tables[0].name == "s");
+	REQUIRE(result->names == vector<string> {"carrier"});
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+	REQUIRE(CHECK_COLUMN(result, 0, {"DHL", "UPS"}));
+	REQUIRE(!result->next);
+
+	result = con.Query("SELECT \"resultdb\" FROM (SELECT 42 AS \"resultdb\") t");
+	REQUIRE(!result->HasError());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+	auto reserved_keyword_result = con.Query("SELECT resultdb FROM (SELECT 42 AS \"resultdb\") t");
+	REQUIRE(reserved_keyword_result->HasError());
+
+	auto unsupported_outer_join =
+	    con.Query("SELECT RESULTDB * FROM customers c LEFT JOIN orders o ON c.id = o.customer_id");
+	REQUIRE(unsupported_outer_join->HasError());
+}
+
+TEST_CASE("Test ResultDB query returns larger source relation set", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE regions AS SELECT i::INTEGER id, 'region_' || i::VARCHAR name "
+	                          "FROM range(1, 5) tbl(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE customers AS SELECT i::INTEGER id, 'customer_' || i::VARCHAR name, "
+	                          "(((i - 1) % 4) + 1)::INTEGER region_id FROM range(1, 21) tbl(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE orders AS SELECT i::INTEGER id, (((i - 1) % 20) + 1)::INTEGER customer_id, "
+	                          "(100 + i)::INTEGER amount FROM range(1, 61) tbl(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE products AS SELECT i::INTEGER id, 'product_' || i::VARCHAR name, "
+	                          "(10 * i)::INTEGER price FROM range(1, 11) tbl(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE lineitems AS SELECT i::INTEGER id, (((i - 1) % 60) + 1)::INTEGER order_id, "
+	                          "(((i - 1) % 10) + 1)::INTEGER product_id, (((i - 1) % 3) + 1)::INTEGER quantity "
+	                          "FROM range(1, 181) tbl(i)"));
+
+	const string from_clause =
+	    " FROM regions r "
+	    "JOIN customers c ON c.region_id = r.id "
+	    "JOIN orders o ON o.customer_id = c.id "
+	    "JOIN lineitems l ON l.order_id = o.id "
+	    "JOIN products p ON p.id = l.product_id "
+	    "WHERE r.id IN (2, 3) AND p.id <= 4";
+
+	duckdb::unique_ptr<QueryResult> result =
+	    con.Query("SELECT RESULTDB r.*, c.id, c.name, o.id, o.amount, l.id, l.quantity, p.id, p.name" + from_clause);
+	REQUIRE(!result->HasError());
+
+	auto expected_regions = con.Query("SELECT DISTINCT r.id, r.name" + from_clause);
+	auto expected_customers = con.Query("SELECT DISTINCT c.id, c.name" + from_clause);
+	auto expected_orders = con.Query("SELECT DISTINCT o.id, o.amount" + from_clause);
+	auto expected_lineitems = con.Query("SELECT DISTINCT l.id, l.quantity" + from_clause);
+	auto expected_products = con.Query("SELECT DISTINCT p.id, p.name" + from_clause);
+
+	RequireResultDBTable(*result, "r", *expected_regions);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "c", *expected_customers);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "o", *expected_orders);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 12);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "l", *expected_lineitems);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 36);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "p", *expected_products);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
+	REQUIRE(!result->next);
+
+	result = con.Query("SELECT RESULTDB c.id, c.name, p.id, p.name" + from_clause);
+	REQUIRE(!result->HasError());
+	RequireResultDBTable(*result, "c", *expected_customers);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "p", *expected_products);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
+	REQUIRE(!result->next);
+
+	result = con.Query("SELECT RESULTDB *" + from_clause);
+	REQUIRE(!result->HasError());
+
+	auto expected_all_regions = con.Query("SELECT DISTINCT r.id, r.name" + from_clause);
+	auto expected_all_customers = con.Query("SELECT DISTINCT c.id, c.name, c.region_id" + from_clause);
+	auto expected_all_orders = con.Query("SELECT DISTINCT o.id, o.customer_id, o.amount" + from_clause);
+	auto expected_all_lineitems = con.Query("SELECT DISTINCT l.id, l.order_id, l.product_id, l.quantity" + from_clause);
+	auto expected_all_products = con.Query("SELECT DISTINCT p.id, p.name, p.price" + from_clause);
+
+	RequireResultDBTable(*result, "r", *expected_all_regions);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "c", *expected_all_customers);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "o", *expected_all_orders);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 12);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "l", *expected_all_lineitems);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 36);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "p", *expected_all_products);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
 	REQUIRE(!result->next);
 }
 
