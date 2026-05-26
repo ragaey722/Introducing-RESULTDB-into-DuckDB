@@ -67,6 +67,11 @@ string StatementReturnTypeToString(StatementReturnType type);
 class Catalog;
 class ClientContext;
 
+enum class ResultDBStrategy : uint8_t { DECOMPOSE, SEMIJOIN, AUTO };
+
+DUCKDB_API ResultDBStrategy ResultDBStrategyFromString(const string &strategy);
+DUCKDB_API string ResultDBStrategyToString(ResultDBStrategy strategy);
+
 //! Metadata that lets the result collector split a flat SELECT RESULTDB result
 //! back into separate per-table results.
 struct ResultDBColumnMetadata {
@@ -85,6 +90,9 @@ struct ResultDBTableMetadata {
 
 struct ResultDBProperties {
 	bool enabled = false;
+	//! Selected execution strategy for this RESULTDB statement. The collector still performs the final table split for
+	//! every strategy; non-decompose strategies can reduce the plan before collection.
+	ResultDBStrategy strategy = ResultDBStrategy::DECOMPOSE;
 	//! Tables to return after decomposing the flat SELECT result, in output order.
 	vector<ResultDBTableMetadata> tables;
 };

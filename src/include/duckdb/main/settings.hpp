@@ -1581,6 +1581,18 @@ struct ProgressBarTimeSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct ResultdbStrategySetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "resultdb_strategy";
+	static constexpr const char *Description =
+	    "Execution strategy used for SELECT RESULTDB queries (decompose, semijoin, or auto)";
+	static constexpr const char *InputType = "VARCHAR";
+	static constexpr const char *DefaultValue = "decompose";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
 struct ScalarSubqueryErrorOnMultipleRowsSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "scalar_subquery_error_on_multiple_rows";

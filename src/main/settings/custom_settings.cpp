@@ -13,6 +13,7 @@
 
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/enums/access_mode.hpp"
+#include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -1574,6 +1575,14 @@ void ProgressBarTimeSetting::ResetLocal(ClientContext &context) {
 
 Value ProgressBarTimeSetting::GetSetting(const ClientContext &context) {
 	return Value::BIGINT(ClientConfig::GetConfig(context).wait_time);
+}
+
+//===----------------------------------------------------------------------===//
+// Result D B Strategy
+//===----------------------------------------------------------------------===//
+void ResultdbStrategySetting::OnSet(SettingCallbackInfo &, Value &input) {
+	auto strategy = ResultDBStrategyFromString(input.GetValue<string>());
+	input = Value(ResultDBStrategyToString(strategy));
 }
 
 //===----------------------------------------------------------------------===//

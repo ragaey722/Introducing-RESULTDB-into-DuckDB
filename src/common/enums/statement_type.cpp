@@ -1,8 +1,37 @@
 #include "duckdb/common/enums/statement_type.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
+
+ResultDBStrategy ResultDBStrategyFromString(const string &strategy) {
+	auto normalized = StringUtil::Lower(strategy);
+	if (normalized == "decompose") {
+		return ResultDBStrategy::DECOMPOSE;
+	}
+	if (normalized == "semijoin") {
+		return ResultDBStrategy::SEMIJOIN;
+	}
+	if (normalized == "auto") {
+		return ResultDBStrategy::AUTO;
+	}
+	throw InvalidInputException("Unrecognized resultdb_strategy \"%s\". Expected decompose, semijoin, or auto",
+	                            strategy);
+}
+
+string ResultDBStrategyToString(ResultDBStrategy strategy) {
+	switch (strategy) {
+	case ResultDBStrategy::DECOMPOSE:
+		return "decompose";
+	case ResultDBStrategy::SEMIJOIN:
+		return "semijoin";
+	case ResultDBStrategy::AUTO:
+		return "auto";
+	}
+	throw InternalException("Unknown ResultDB strategy");
+}
 
 // LCOV_EXCL_START
 string StatementTypeToString(StatementType type) {

@@ -1090,6 +1090,16 @@
         "custom_implementation": true
     },
     {
+        "name": "resultdb_strategy",
+        "description": "Execution strategy used for SELECT RESULTDB queries (decompose, semijoin, or auto)",
+        "type": "VARCHAR",
+        "default_scope": "local",
+        "default_value": "decompose",
+        "on_callbacks": [
+            "set"
+        ]
+    },
+    {
         "name": "scalar_subquery_error_on_multiple_rows",
         "description": "When a scalar subquery returns multiple rows - return a random row instead of returning an error.",
         "type": "BOOLEAN",

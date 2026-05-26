@@ -45,6 +45,15 @@ static void RequireResultDBTable(QueryResult &actual, const string &table_name, 
 	REQUIRE(ResultRows(actual) == ResultRows(expected));
 }
 
+static void RequireResultDBStrategy(QueryResult &actual, ResultDBStrategy strategy) {
+	auto current = &actual;
+	while (current) {
+		REQUIRE(current->properties.resultdb.enabled);
+		REQUIRE(current->properties.resultdb.strategy == strategy);
+		current = current->next.get();
+	}
+}
+
 TEST_CASE("Test comment in CPP API", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -385,6 +394,55 @@ TEST_CASE("Test ResultDB query returns source relations", "[api]") {
 	auto unsupported_outer_join =
 	    con.Query("SELECT RESULTDB * FROM customers c LEFT JOIN orders o ON c.id = o.customer_id");
 	REQUIRE(unsupported_outer_join->HasError());
+}
+
+TEST_CASE("Test ResultDB strategy setting", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE customers(id INTEGER, name VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE orders(id INTEGER, customer_id INTEGER, amount INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO customers VALUES (1, 'Ada'), (2, 'Linus')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO orders VALUES (10, 1, 100), (11, 1, 200), (12, 2, 50)"));
+
+	auto setting_result = con.Query("SELECT current_setting('resultdb_strategy')");
+	REQUIRE(!setting_result->HasError());
+	REQUIRE(CHECK_COLUMN(setting_result, 0, {"decompose"}));
+
+	auto invalid_strategy = con.Query("SET resultdb_strategy = 'invalid'");
+	REQUIRE(invalid_strategy->HasError());
+
+	struct StrategyCase {
+		string input;
+		string stored_value;
+		ResultDBStrategy strategy;
+	};
+	vector<StrategyCase> strategy_cases = {
+	    {"decompose", "decompose", ResultDBStrategy::DECOMPOSE},
+	    {"SEMIJOIN", "semijoin", ResultDBStrategy::SEMIJOIN},
+	    {"auto", "auto", ResultDBStrategy::AUTO},
+	};
+
+	const string from_clause = " FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount >= 100";
+	for (auto &strategy_case : strategy_cases) {
+		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy_case.input + "'"));
+		setting_result = con.Query("SELECT current_setting('resultdb_strategy')");
+		REQUIRE(!setting_result->HasError());
+		REQUIRE(CHECK_COLUMN(setting_result, 0, {strategy_case.stored_value}));
+
+		duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + from_clause);
+		REQUIRE(!result->HasError());
+		RequireResultDBStrategy(*result, strategy_case.strategy);
+
+		auto expected_customers = con.Query("SELECT DISTINCT c.id, c.name" + from_clause);
+		auto expected_orders = con.Query("SELECT DISTINCT o.id, o.customer_id, o.amount" + from_clause);
+
+		RequireResultDBTable(*result, "c", *expected_customers);
+		result = std::move(result->next);
+		REQUIRE(result);
+		RequireResultDBTable(*result, "o", *expected_orders);
+		REQUIRE(!result->next);
+	}
 }
 
 TEST_CASE("Test ResultDB query returns larger source relation set", "[api]") {

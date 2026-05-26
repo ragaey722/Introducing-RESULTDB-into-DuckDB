@@ -5,6 +5,7 @@
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
@@ -759,6 +760,7 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 		// Decomposition needs the complete flat result before any per-table result can be returned.
 		properties.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
 		properties.resultdb.enabled = true;
+		properties.resultdb.strategy = ResultDBStrategyFromString(Settings::Get<ResultdbStrategySetting>(context));
 		properties.resultdb.tables = BuildResultDBTables(resultdb_columns, result.names, result.types);
 	}
 
