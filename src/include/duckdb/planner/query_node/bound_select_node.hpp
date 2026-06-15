@@ -14,6 +14,7 @@
 #include "duckdb/parser/parsed_data/sample_options.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/planner/expression_binder/select_bind_state.hpp"
+#include "duckdb/planner/resultdb_reduced_plan.hpp"
 #include "duckdb/common/index_vector.hpp"
 
 namespace duckdb {
@@ -89,6 +90,9 @@ public:
 	//! Index of pruned node
 	TableIndex prune_index;
 	bool need_prune = false;
+
+	//! Shared Yannakakis program for SELECT RESULTDB semijoin execution.
+	unique_ptr<ResultDBYannakakisProgram> resultdb_yannakakis_program;
 
 public:
 	TableIndex GetRootIndex() override {

@@ -45,11 +45,13 @@ static void RequireResultDBTable(QueryResult &actual, const string &table_name, 
 	REQUIRE(ResultRows(actual) == ResultRows(expected));
 }
 
-static void RequireResultDBStrategy(QueryResult &actual, ResultDBStrategy strategy) {
+static void RequireResultDBStrategy(QueryResult &actual, ResultDBStrategy requested_strategy,
+                                    ResultDBStrategy execution_strategy) {
 	auto current = &actual;
 	while (current) {
 		REQUIRE(current->properties.resultdb.enabled);
-		REQUIRE(current->properties.resultdb.strategy == strategy);
+		REQUIRE(current->properties.resultdb.requested_strategy == requested_strategy);
+		REQUIRE(current->properties.resultdb.execution_strategy == execution_strategy);
 		current = current->next.get();
 	}
 }
@@ -415,12 +417,13 @@ TEST_CASE("Test ResultDB strategy setting", "[api]") {
 	struct StrategyCase {
 		string input;
 		string stored_value;
-		ResultDBStrategy strategy;
+		ResultDBStrategy requested_strategy;
+		ResultDBStrategy execution_strategy;
 	};
 	vector<StrategyCase> strategy_cases = {
-	    {"decompose", "decompose", ResultDBStrategy::DECOMPOSE},
-	    {"SEMIJOIN", "semijoin", ResultDBStrategy::SEMIJOIN},
-	    {"auto", "auto", ResultDBStrategy::AUTO},
+	    {"decompose", "decompose", ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE},
+	    {"SEMIJOIN", "semijoin", ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN},
+	    {"auto", "auto", ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN},
 	};
 
 	const string from_clause = " FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount >= 100";
@@ -432,7 +435,12 @@ TEST_CASE("Test ResultDB strategy setting", "[api]") {
 
 		duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + from_clause);
 		REQUIRE(!result->HasError());
-		RequireResultDBStrategy(*result, strategy_case.strategy);
+		RequireResultDBStrategy(*result, strategy_case.requested_strategy, strategy_case.execution_strategy);
+		if (strategy_case.execution_strategy == ResultDBStrategy::SEMIJOIN) {
+			REQUIRE(result->properties.resultdb.join_edges.size() == 1);
+		} else {
+			REQUIRE(result->properties.resultdb.join_edges.empty());
+		}
 
 		auto expected_customers = con.Query("SELECT DISTINCT c.id, c.name" + from_clause);
 		auto expected_orders = con.Query("SELECT DISTINCT o.id, o.customer_id, o.amount" + from_clause);
@@ -443,6 +451,111 @@ TEST_CASE("Test ResultDB strategy setting", "[api]") {
 		RequireResultDBTable(*result, "o", *expected_orders);
 		REQUIRE(!result->next);
 	}
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	duckdb::unique_ptr<QueryResult> reordered_result =
+	    con.Query("SELECT RESULTDB o.amount, c.name, o.id" + from_clause);
+	REQUIRE(!reordered_result->HasError());
+	RequireResultDBStrategy(*reordered_result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	auto expected_reordered_orders = con.Query("SELECT DISTINCT o.amount, o.id" + from_clause);
+	auto expected_reordered_customers = con.Query("SELECT DISTINCT c.name" + from_clause);
+	RequireResultDBTable(*reordered_result, "o", *expected_reordered_orders);
+	reordered_result = std::move(reordered_result->next);
+	REQUIRE(reordered_result);
+	RequireResultDBTable(*reordered_result, "c", *expected_reordered_customers);
+	REQUIRE(!reordered_result->next);
+}
+
+TEST_CASE("Test ResultDB semijoin deduplicates duplicate source rows", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE customers(id INTEGER, name VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE orders(id INTEGER, customer_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO customers VALUES (1, 'Ada'), (1, 'Ada'), (2, 'Linus')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO orders VALUES (10, 1), (20, 2)"));
+
+	const string from_clause = " FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.id = 10";
+	auto expected_customers = con.Query("SELECT DISTINCT c.id, c.name" + from_clause);
+	auto expected_orders = con.Query("SELECT DISTINCT o.id, o.customer_id" + from_clause);
+	REQUIRE(!expected_customers->HasError());
+	REQUIRE(!expected_orders->HasError());
+
+	struct StrategyCase {
+		string setting;
+		ResultDBStrategy requested_strategy;
+		ResultDBStrategy execution_strategy;
+	};
+	vector<StrategyCase> strategy_cases = {
+	    {"decompose", ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE},
+	    {"semijoin", ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN},
+	};
+
+	for (auto &strategy_case : strategy_cases) {
+		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy_case.setting + "'"));
+		duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + from_clause);
+		REQUIRE(!result->HasError());
+		RequireResultDBStrategy(*result, strategy_case.requested_strategy, strategy_case.execution_strategy);
+
+		RequireResultDBTable(*result, "c", *expected_customers);
+		REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+		REQUIRE(CHECK_COLUMN(result, 0, {1}));
+		REQUIRE(CHECK_COLUMN(result, 1, {"Ada"}));
+
+		result = std::move(result->next);
+		REQUIRE(result);
+		RequireResultDBTable(*result, "o", *expected_orders);
+		REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+		REQUIRE(CHECK_COLUMN(result, 0, {10}));
+		REQUIRE(CHECK_COLUMN(result, 1, {1}));
+		REQUIRE(!result->next);
+	}
+}
+
+TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE a(id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE b(id INTEGER, a_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE c(id INTEGER, b_id INTEGER, a_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO a VALUES (1), (2)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO b VALUES (10, 1), (20, 2)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO c VALUES (100, 10, 1), (200, 20, 2)"));
+
+	const string cyclic_from =
+	    " FROM a "
+	    "JOIN b ON a.id = b.a_id "
+	    "JOIN c ON b.id = c.b_id AND c.a_id = a.id";
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	auto result = con.Query("SELECT RESULTDB *" + cyclic_from);
+	REQUIRE(result->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
+	result = con.Query("SELECT RESULTDB *" + cyclic_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
+	REQUIRE(result->properties.resultdb.join_edges.empty());
+
+	const string non_equality_from = " FROM a JOIN b ON a.id < b.a_id";
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	result = con.Query("SELECT RESULTDB *" + non_equality_from);
+	REQUIRE(result->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
+	result = con.Query("SELECT RESULTDB *" + non_equality_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
+
+	const string cross_table_where_from = " FROM a JOIN b ON a.id = b.a_id WHERE a.id = b.a_id";
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	result = con.Query("SELECT RESULTDB *" + cross_table_where_from);
+	REQUIRE(result->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
+	result = con.Query("SELECT RESULTDB *" + cross_table_where_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
 }
 
 TEST_CASE("Test ResultDB query returns larger source relation set", "[api]") {
@@ -522,6 +635,36 @@ TEST_CASE("Test ResultDB query returns larger source relation set", "[api]") {
 	auto expected_all_orders = con.Query("SELECT DISTINCT o.id, o.customer_id, o.amount" + from_clause);
 	auto expected_all_lineitems = con.Query("SELECT DISTINCT l.id, l.order_id, l.product_id, l.quantity" + from_clause);
 	auto expected_all_products = con.Query("SELECT DISTINCT p.id, p.name, p.price" + from_clause);
+
+	RequireResultDBTable(*result, "r", *expected_all_regions);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "c", *expected_all_customers);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "o", *expected_all_orders);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 12);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "l", *expected_all_lineitems);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 36);
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "p", *expected_all_products);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
+	REQUIRE(!result->next);
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	result = con.Query("SELECT RESULTDB *" + from_clause);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 4);
 
 	RequireResultDBTable(*result, "r", *expected_all_regions);
 	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);

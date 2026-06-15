@@ -13,6 +13,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/enums/set_operation_type.hpp"
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/planner/resultdb_reduced_plan.hpp"
 
 namespace duckdb {
 
@@ -27,6 +28,7 @@ struct ExtraBoundInfo {
 	vector<shared_ptr<Binder>> child_binders;
 	vector<BoundStatement> bound_children;
 	vector<unique_ptr<ParsedExpression>> original_expressions;
+	unique_ptr<ResultDBYannakakisProgram> resultdb_yannakakis_program;
 };
 
 struct BoundStatement {

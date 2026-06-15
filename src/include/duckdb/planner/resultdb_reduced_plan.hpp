@@ -1,0 +1,80 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb/planner/resultdb_reduced_plan.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/common/common.hpp"
+#include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/types.hpp"
+
+namespace duckdb {
+
+class ColumnDataCollection;
+class LogicalOperator;
+class PhysicalPlan;
+
+struct ResultDBYannakakisRelation {
+	//! Bound relation occurrence represented by this working relation.
+	idx_t table_index = DConstants::INVALID_INDEX;
+	//! Source column indexes stored in this working relation, in working-column order.
+	vector<idx_t> source_column_indices;
+	//! Working relation output names/types.
+	vector<string> names;
+	vector<LogicalType> types;
+	//! Logical plan that materializes the filtered, projected, duplicate-free base relation.
+	unique_ptr<LogicalOperator> base_plan;
+};
+
+struct ResultDBYannakakisJoinColumn {
+	idx_t left_column_index = DConstants::INVALID_INDEX;
+	idx_t right_column_index = DConstants::INVALID_INDEX;
+};
+
+struct ResultDBYannakakisEdge {
+	idx_t left_relation = DConstants::INVALID_INDEX;
+	idx_t right_relation = DConstants::INVALID_INDEX;
+	vector<ResultDBYannakakisJoinColumn> columns;
+};
+
+struct ResultDBYannakakisOutputColumn {
+	idx_t working_column_index = DConstants::INVALID_INDEX;
+	string name;
+	LogicalType type;
+};
+
+struct ResultDBYannakakisOutputTable {
+	idx_t relation = DConstants::INVALID_INDEX;
+	idx_t table_metadata_index = DConstants::INVALID_INDEX;
+	vector<ResultDBYannakakisOutputColumn> columns;
+};
+
+struct ResultDBYannakakisProgram {
+	idx_t root_relation = DConstants::INVALID_INDEX;
+	vector<ResultDBYannakakisRelation> relations;
+	vector<ResultDBYannakakisEdge> edges;
+	vector<ResultDBYannakakisOutputTable> outputs;
+};
+
+enum class ResultDBYannakakisPhaseType : uint8_t { BASE, SEMIJOIN, OUTPUT };
+
+struct PreparedResultDBYannakakisPhase {
+	ResultDBYannakakisPhaseType type = ResultDBYannakakisPhaseType::BASE;
+	idx_t target_collection = DConstants::INVALID_INDEX;
+	idx_t output_table_index = DConstants::INVALID_INDEX;
+	vector<idx_t> dependencies;
+	unique_ptr<PhysicalPlan> plan;
+};
+
+struct PreparedResultDBYannakakisProgram {
+	//! Shared materialized phase outputs. LogicalColumnDataGet scans hold shared_ptrs to these collections; the
+	//! direct collector resets and reuses them at execution start, so the prepared program is not re-entrant.
+	vector<shared_ptr<ColumnDataCollection>> collections;
+	vector<PreparedResultDBYannakakisPhase> phases;
+};
+
+} // namespace duckdb

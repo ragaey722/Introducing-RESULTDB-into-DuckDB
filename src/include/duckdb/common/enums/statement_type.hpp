@@ -77,6 +77,8 @@ DUCKDB_API string ResultDBStrategyToString(ResultDBStrategy strategy);
 struct ResultDBColumnMetadata {
 	//! Position of this column in the normal flat SELECT output before decomposition.
 	idx_t flat_column_index;
+	//! Position of this column in its source relation occurrence.
+	idx_t source_column_index = DConstants::INVALID_INDEX;
 	string name;
 	LogicalType type;
 };
@@ -84,17 +86,34 @@ struct ResultDBColumnMetadata {
 struct ResultDBTableMetadata {
 	//! Table alias used in the SELECT query.
 	string name;
+	//! Bound relation occurrence for this table alias.
+	idx_t table_index = DConstants::INVALID_INDEX;
 	//! Output columns selected for this table, in table-local output order.
 	vector<ResultDBColumnMetadata> columns;
 };
 
+struct ResultDBJoinColumnMetadata {
+	idx_t left_column_index = DConstants::INVALID_INDEX;
+	idx_t right_column_index = DConstants::INVALID_INDEX;
+};
+
+struct ResultDBJoinEdgeMetadata {
+	//! Bound relation occurrences connected by this equality edge.
+	idx_t left_table_index = DConstants::INVALID_INDEX;
+	idx_t right_table_index = DConstants::INVALID_INDEX;
+	vector<ResultDBJoinColumnMetadata> columns;
+};
+
 struct ResultDBProperties {
 	bool enabled = false;
-	//! Selected execution strategy for this RESULTDB statement. The collector still performs the final table split for
-	//! every strategy; non-decompose strategies can reduce the plan before collection.
-	ResultDBStrategy strategy = ResultDBStrategy::DECOMPOSE;
+	//! Strategy requested through SET resultdb_strategy.
+	ResultDBStrategy requested_strategy = ResultDBStrategy::DECOMPOSE;
+	//! Strategy chosen by planning. AUTO can resolve to either SEMIJOIN or DECOMPOSE.
+	ResultDBStrategy execution_strategy = ResultDBStrategy::DECOMPOSE;
 	//! Tables to return after decomposing the flat SELECT result, in output order.
 	vector<ResultDBTableMetadata> tables;
+	//! Equality join graph used by the semijoin strategy.
+	vector<ResultDBJoinEdgeMetadata> join_edges;
 };
 
 //! A struct containing various properties of a SQL statement

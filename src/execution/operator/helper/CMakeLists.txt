@@ -13,6 +13,7 @@ add_library_unity(
   physical_materialized_collector.cpp
   physical_pragma.cpp
   physical_prepare.cpp
+  physical_resultdb_direct_collector.cpp
   physical_reservoir_sample.cpp
   physical_result_collector.cpp
   physical_set.cpp

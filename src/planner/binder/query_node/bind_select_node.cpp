@@ -37,8 +37,12 @@ namespace duckdb {
 struct ResultDBColumnBindInfo {
 	//! Position of the selected column in the flat projection that DuckDB will execute normally.
 	idx_t flat_column_index;
+	//! Position of the selected column in its source relation occurrence.
+	idx_t source_column_index = DConstants::INVALID_INDEX;
 	//! Bound table alias that owns this selected column.
 	string table_name;
+	//! Bound relation occurrence that owns this selected column.
+	idx_t table_index = DConstants::INVALID_INDEX;
 };
 
 static void CheckResultDBSupported(const SelectNode &statement) {
@@ -89,23 +93,26 @@ static vector<ResultDBTableMetadata> BuildResultDBTables(const vector<ResultDBCo
                                                          const vector<string> &names,
                                                          const vector<LogicalType> &types) {
 	vector<ResultDBTableMetadata> tables;
-	case_insensitive_map_t<idx_t> table_map;
+	unordered_map<idx_t, idx_t> table_map;
 	for (auto &column_info : resultdb_columns) {
 		D_ASSERT(column_info.flat_column_index < names.size());
 		D_ASSERT(column_info.flat_column_index < types.size());
-		auto entry = table_map.find(column_info.table_name);
+		D_ASSERT(column_info.table_index != DConstants::INVALID_INDEX);
+		auto entry = table_map.find(column_info.table_index);
 		idx_t table_index;
 		if (entry == table_map.end()) {
 			table_index = tables.size();
-			table_map[column_info.table_name] = table_index;
+			table_map[column_info.table_index] = table_index;
 			ResultDBTableMetadata table;
 			table.name = column_info.table_name;
+			table.table_index = column_info.table_index;
 			tables.push_back(std::move(table));
 		} else {
 			table_index = entry->second;
 		}
 		ResultDBColumnMetadata column;
 		column.flat_column_index = column_info.flat_column_index;
+		column.source_column_index = column_info.source_column_index;
 		column.name = names[column_info.flat_column_index];
 		column.type = types[column_info.flat_column_index];
 		tables[table_index].columns.push_back(std::move(column));
@@ -698,6 +705,15 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 			continue;
 		}
 
+		if (statement.resultdb && is_original_column) {
+			if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+				throw BinderException("RESULTDB select list can only contain bound source columns");
+			}
+			auto &colref = expr->Cast<BoundColumnRefExpression>();
+			resultdb_columns[i].table_index = colref.binding.table_index.index;
+			resultdb_columns[i].source_column_index = colref.binding.column_index.GetIndex();
+		}
+
 		if (expr->IsVolatile()) {
 			bind_state.SetExpressionIsVolatile(i);
 		}
@@ -760,7 +776,9 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 		// Decomposition needs the complete flat result before any per-table result can be returned.
 		properties.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
 		properties.resultdb.enabled = true;
-		properties.resultdb.strategy = ResultDBStrategyFromString(Settings::Get<ResultdbStrategySetting>(context));
+		properties.resultdb.requested_strategy = ResultDBStrategyFromString(Settings::Get<ResultdbStrategySetting>(context));
+		properties.resultdb.execution_strategy = properties.resultdb.requested_strategy;
+		properties.resultdb.join_edges.clear();
 		properties.resultdb.tables = BuildResultDBTables(resultdb_columns, result.names, result.types);
 	}
 
@@ -812,6 +830,7 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 	result_statement.names = result.names;
 	result_statement.plan = CreatePlan(result);
 	result_statement.extra_info.original_expressions = std::move(result.bind_state.original_expressions);
+	result_statement.extra_info.resultdb_yannakakis_program = std::move(result.resultdb_yannakakis_program);
 	return result_statement;
 }
 

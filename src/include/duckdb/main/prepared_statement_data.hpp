@@ -15,6 +15,7 @@
 #include "duckdb/common/winapi.hpp"
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 #include "duckdb/planner/bound_parameter_map.hpp"
+#include "duckdb/planner/resultdb_reduced_plan.hpp"
 
 namespace duckdb {
 class CatalogEntry;
@@ -33,6 +34,8 @@ public:
 
 	//! The physical plan.
 	unique_ptr<PhysicalPlan> physical_plan;
+	//! Shared physical Yannakakis program for direct SELECT RESULTDB semijoin output.
+	unique_ptr<PreparedResultDBYannakakisProgram> resultdb_yannakakis_program;
 
 	//! The result names of the transaction
 	vector<string> names;
