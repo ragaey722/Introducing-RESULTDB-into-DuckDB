@@ -561,8 +561,16 @@ static unique_ptr<PhysicalPlan> PlanResultDBYannakakisPhase(ClientContext &conte
                                                            unique_ptr<LogicalOperator> logical_plan, bool optimize) {
 	// Each materialization phase is still planned through DuckDB's normal optimizer/physical planner.
 	if (optimize && logical_plan->RequireOptimizer()) {
+		auto resultdb_properties = binder.GetStatementProperties().resultdb;
+		binder.GetStatementProperties().resultdb.enabled = false;
 		Optimizer optimizer(binder, context);
-		logical_plan = optimizer.Optimize(std::move(logical_plan));
+		try {
+			logical_plan = optimizer.Optimize(std::move(logical_plan));
+		} catch (...) {
+			binder.GetStatementProperties().resultdb = std::move(resultdb_properties);
+			throw;
+		}
+		binder.GetStatementProperties().resultdb = std::move(resultdb_properties);
 		D_ASSERT(logical_plan);
 #ifdef DEBUG
 		logical_plan->Verify(context);
@@ -613,11 +621,13 @@ PrepareResultDBYannakakisProgram(ClientContext &context, Binder &binder, ResultD
 		current_producer[relation_idx] = phase_idx;
 	}
 
-	auto adjacency = BuildResultDBYannakakisAdjacency(program);
-	vector<idx_t> parent;
-	vector<idx_t> parent_edge;
-	vector<idx_t> order;
-	BuildResultDBYannakakisOrder(program, adjacency, parent, parent_edge, order);
+	auto parent = program.parent;
+	auto parent_edge = program.parent_edge;
+	auto order = program.order;
+	if (order.empty()) {
+		auto adjacency = BuildResultDBYannakakisAdjacency(program);
+		BuildResultDBYannakakisOrder(program, adjacency, parent, parent_edge, order);
+	}
 
 	for (idx_t order_offset = order.size(); order_offset > 0; order_offset--) {
 		auto child = order[order_offset - 1];
@@ -721,10 +731,13 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 			optimize = false;
 		}
 	}
+	unique_ptr<ResultDBYannakakisProgram> resultdb_yannakakis_program;
 	if (optimize && logical_plan->RequireOptimizer()) {
 		profiler.StartPhase(MetricType::ALL_OPTIMIZERS);
 		Optimizer optimizer(*logical_planner.binder, *this);
 		logical_plan = optimizer.Optimize(std::move(logical_plan));
+		resultdb_yannakakis_program = std::move(optimizer.resultdb_yannakakis_program);
+		result->properties.resultdb = logical_planner.binder->GetStatementProperties().resultdb;
 		D_ASSERT(logical_plan);
 		profiler.EndPhase();
 
@@ -733,10 +746,9 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 #endif
 	}
 
-	if (logical_planner.resultdb_yannakakis_program) {
+	if (resultdb_yannakakis_program) {
 		result->resultdb_yannakakis_program =
-		    PrepareResultDBYannakakisProgram(*this, *logical_planner.binder, *logical_planner.resultdb_yannakakis_program,
-		                                    optimize);
+		    PrepareResultDBYannakakisProgram(*this, *logical_planner.binder, *resultdb_yannakakis_program, optimize);
 	}
 
 	// Convert the logical query plan into a physical query plan.

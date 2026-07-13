@@ -55,6 +55,9 @@ struct ResultDBYannakakisOutputTable {
 
 struct ResultDBYannakakisProgram {
 	idx_t root_relation = DConstants::INVALID_INDEX;
+	vector<idx_t> parent;
+	vector<idx_t> parent_edge;
+	vector<idx_t> order;
 	vector<ResultDBYannakakisRelation> relations;
 	vector<ResultDBYannakakisEdge> edges;
 	vector<ResultDBYannakakisOutputTable> outputs;

@@ -46,7 +46,6 @@ static void RunPostBindExtensions(ClientContext &context, Binder &binder, BoundS
 void Planner::CreatePlan(SQLStatement &statement) {
 	auto &profiler = QueryProfiler::Get(context);
 	auto parameter_count = statement.named_param_map.size();
-	resultdb_yannakakis_program.reset();
 
 	BoundParameterMap bound_parameters(parameter_data);
 
@@ -62,12 +61,10 @@ void Planner::CreatePlan(SQLStatement &statement) {
 
 		this->names = bound_statement.names;
 		this->types = bound_statement.types;
-		this->resultdb_yannakakis_program = std::move(bound_statement.extra_info.resultdb_yannakakis_program);
 		this->plan = std::move(bound_statement.plan);
 	} catch (const std::exception &ex) {
 		ErrorData error(ex);
 		this->plan = nullptr;
-		this->resultdb_yannakakis_program.reset();
 		if (error.Type() == ExceptionType::PARAMETER_NOT_RESOLVED) {
 			// parameter types could not be resolved
 			this->names = {"unknown"};
@@ -83,8 +80,6 @@ void Planner::CreatePlan(SQLStatement &statement) {
 
 					this->names = bound_statement.names;
 					this->types = bound_statement.types;
-					this->resultdb_yannakakis_program =
-					    std::move(bound_statement.extra_info.resultdb_yannakakis_program);
 					this->plan = std::move(bound_statement.plan);
 					break;
 				}
@@ -107,11 +102,6 @@ void Planner::CreatePlan(SQLStatement &statement) {
 	properties.bound_all_parameters = !bound_parameters.rebind && parameters_resolved;
 
 	Planner::VerifyPlan(context, plan, bound_parameters.GetParametersPtr());
-	if (resultdb_yannakakis_program) {
-		for (auto &relation : resultdb_yannakakis_program->relations) {
-			Planner::VerifyPlan(context, relation.base_plan, bound_parameters.GetParametersPtr());
-		}
-	}
 
 	// set up a map of parameter number -> value entries
 	for (auto &kv : bound_parameters.GetParameters()) {

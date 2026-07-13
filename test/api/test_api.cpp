@@ -550,12 +550,39 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	const string cross_table_where_from = " FROM a JOIN b ON a.id = b.a_id WHERE a.id = b.a_id";
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
 	result = con.Query("SELECT RESULTDB *" + cross_table_where_from);
-	REQUIRE(result->HasError());
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
 
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
 	result = con.Query("SELECT RESULTDB *" + cross_table_where_from);
 	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN);
+
+	const string cross_product_where_from = " FROM a, b WHERE a.id = b.a_id";
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	result = con.Query("SELECT RESULTDB *" + cross_product_where_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+
+	const string cross_table_non_equality_where_from = " FROM a JOIN b ON a.id = b.a_id WHERE a.id < b.a_id";
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	result = con.Query("SELECT RESULTDB *" + cross_table_non_equality_where_from);
+	REQUIRE(result->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
+	result = con.Query("SELECT RESULTDB *" + cross_table_non_equality_where_from);
+	REQUIRE(!result->HasError());
 	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	result = con.Query("SELECT RESULTDB * FROM a JOIN b ON a.id = b.a_id WHERE 1 = 0");
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 0);
+	duckdb::unique_ptr<QueryResult> next_result = std::move(result->next);
+	REQUIRE(next_result);
+	REQUIRE(next_result->Cast<MaterializedQueryResult>().RowCount() == 0);
+	REQUIRE(!next_result->next);
 }
 
 TEST_CASE("Test ResultDB query returns larger source relation set", "[api]") {

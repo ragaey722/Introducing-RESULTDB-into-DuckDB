@@ -11,6 +11,7 @@
 #include "duckdb/optimizer/expression_rewriter.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/resultdb_reduced_plan.hpp"
 #include "duckdb/common/enums/optimizer_type.hpp"
 
 #include <functional>
@@ -34,6 +35,7 @@ public:
 	ClientContext &context;
 	Binder &binder;
 	ExpressionRewriter rewriter;
+	unique_ptr<ResultDBYannakakisProgram> resultdb_yannakakis_program;
 
 private:
 	void RunBuiltInOptimizers();

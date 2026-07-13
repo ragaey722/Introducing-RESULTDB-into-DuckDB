@@ -12,7 +12,6 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/bound_parameter_map.hpp"
-#include "duckdb/planner/resultdb_reduced_plan.hpp"
 
 namespace duckdb {
 class ClientContext;
@@ -37,7 +36,6 @@ public:
 
 	StatementProperties properties;
 	bound_parameter_map_t value_map;
-	unique_ptr<ResultDBYannakakisProgram> resultdb_yannakakis_program;
 
 public:
 	void CreatePlan(unique_ptr<SQLStatement> statement);

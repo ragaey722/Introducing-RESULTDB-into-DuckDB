@@ -24,6 +24,7 @@
 #include "duckdb/optimizer/regex_range_filter.hpp"
 #include "duckdb/optimizer/remove_duplicate_groups.hpp"
 #include "duckdb/optimizer/remove_unused_columns.hpp"
+#include "duckdb/optimizer/resultdb_yannakakis_optimizer.hpp"
 #include "duckdb/optimizer/row_group_pruner.hpp"
 #include "duckdb/optimizer/rule/distinct_aggregate_optimizer.hpp"
 #include "duckdb/optimizer/rule/equal_or_null_simplification.hpp"
@@ -180,6 +181,12 @@ void Optimizer::RunBuiltInOptimizers() {
 		FilterPullup filter_pullup;
 		plan = filter_pullup.Rewrite(std::move(plan));
 	});
+
+	ResultDBYannakakisOptimizer resultdb_yannakakis_optimizer(binder, context);
+	plan = resultdb_yannakakis_optimizer.Optimize(std::move(plan), resultdb_yannakakis_program);
+	if (resultdb_yannakakis_program) {
+		return;
+	}
 
 	// perform filter pushdown
 	RunOptimizer(OptimizerType::FILTER_PUSHDOWN, [&]() {
@@ -387,6 +394,7 @@ void Optimizer::RunBuiltInOptimizers() {
 }
 
 unique_ptr<LogicalOperator> Optimizer::Optimize(unique_ptr<LogicalOperator> plan_p) {
+	resultdb_yannakakis_program.reset();
 	Verify(*plan_p);
 
 	this->plan = std::move(plan_p);

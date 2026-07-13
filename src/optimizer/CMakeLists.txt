@@ -35,6 +35,7 @@ add_library_unity(
   partitioned_execution.cpp
   join_elimination.cpp
   regex_range_filter.cpp
+  resultdb_yannakakis_optimizer.cpp
   remove_duplicate_groups.cpp
   remove_unused_columns.cpp
   row_group_pruner.cpp

@@ -830,7 +830,6 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 	result_statement.names = result.names;
 	result_statement.plan = CreatePlan(result);
 	result_statement.extra_info.original_expressions = std::move(result.bind_state.original_expressions);
-	result_statement.extra_info.resultdb_yannakakis_program = std::move(result.resultdb_yannakakis_program);
 	return result_statement;
 }
 
