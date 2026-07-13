@@ -512,6 +512,41 @@ TEST_CASE("Test ResultDB semijoin deduplicates duplicate source rows", "[api]") 
 	}
 }
 
+TEST_CASE("Test ResultDB decompose deduplicates duplicate rows with NULL values", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE customers(id INTEGER, name VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE orders(id INTEGER, customer_id INTEGER, note VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO customers VALUES (1, NULL), (1, NULL), (2, 'Linus')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO orders VALUES (10, 1, NULL), (10, 1, NULL), (20, 2, 'other')"));
+
+	const string from_clause = " FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.id = 10";
+	auto expected_customers = con.Query("SELECT DISTINCT c.id, c.name" + from_clause);
+	auto expected_orders = con.Query("SELECT DISTINCT o.id, o.customer_id, o.note" + from_clause);
+	REQUIRE(!expected_customers->HasError());
+	REQUIRE(!expected_orders->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'decompose'"));
+	duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + from_clause);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE);
+
+	RequireResultDBTable(*result, "c", *expected_customers);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE(CHECK_COLUMN(result, 1, {Value()}));
+
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "o", *expected_orders);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	REQUIRE(CHECK_COLUMN(result, 0, {10}));
+	REQUIRE(CHECK_COLUMN(result, 1, {1}));
+	REQUIRE(CHECK_COLUMN(result, 2, {Value()}));
+	REQUIRE(!result->next);
+}
+
 TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);

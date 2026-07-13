@@ -4,6 +4,7 @@
 #include "duckdb/execution/operator/helper/physical_buffered_batch_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_materialized_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_buffered_collector.hpp"
+#include "duckdb/execution/operator/helper/physical_resultdb_decompose_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_resultdb_direct_collector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/config.hpp"
@@ -30,6 +31,9 @@ unique_ptr<PhysicalOperator> PhysicalResultCollector::GetResultCollector(ClientC
 
 	if (data.properties.resultdb.enabled && data.properties.resultdb.execution_strategy == ResultDBStrategy::SEMIJOIN) {
 		return make_uniq<PhysicalResultDBDirectCollector>(physical_plan, data);
+	}
+	if (data.properties.resultdb.enabled && data.properties.resultdb.execution_strategy == ResultDBStrategy::DECOMPOSE) {
+		return make_uniq<PhysicalResultDBDecomposeCollector>(physical_plan, data);
 	}
 
 	if (!PhysicalPlanGenerator::PreserveInsertionOrder(context, root)) {
