@@ -553,24 +553,49 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE a(id INTEGER)"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE b(id INTEGER, a_id INTEGER)"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE c(id INTEGER, b_id INTEGER, a_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE c(id INTEGER, b_id INTEGER, a_id INTEGER, note VARCHAR)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO a VALUES (1), (2)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO b VALUES (10, 1), (20, 2)"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO c VALUES (100, 10, 1), (200, 20, 2)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO c VALUES (100, 10, 1, NULL), (100, 10, 1, NULL), (200, 20, 2, 'x')"));
 
 	const string cyclic_from =
 	    " FROM a "
 	    "JOIN b ON a.id = b.a_id "
 	    "JOIN c ON b.id = c.b_id AND c.a_id = a.id";
+	auto expected_cyclic_a = con.Query("SELECT DISTINCT a.id" + cyclic_from);
+	auto expected_cyclic_b = con.Query("SELECT DISTINCT b.id, b.a_id" + cyclic_from);
+	auto expected_cyclic_c = con.Query("SELECT DISTINCT c.id, c.b_id, c.a_id, c.note" + cyclic_from);
+	REQUIRE(!expected_cyclic_a->HasError());
+	REQUIRE(!expected_cyclic_b->HasError());
+	REQUIRE(!expected_cyclic_c->HasError());
+
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
-	auto result = con.Query("SELECT RESULTDB *" + cyclic_from);
-	REQUIRE(result->HasError());
+	duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + cyclic_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 3);
+	RequireResultDBTable(*result, "a", *expected_cyclic_a);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "b", *expected_cyclic_b);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "c", *expected_cyclic_c);
+	REQUIRE(!result->next);
 
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
 	result = con.Query("SELECT RESULTDB *" + cyclic_from);
 	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
-	REQUIRE(result->properties.resultdb.join_edges.empty());
+	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 3);
+	RequireResultDBTable(*result, "a", *expected_cyclic_a);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "b", *expected_cyclic_b);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "c", *expected_cyclic_c);
+	REQUIRE(!result->next);
 
 	const string non_equality_from = " FROM a JOIN b ON a.id < b.a_id";
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));

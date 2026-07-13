@@ -18,10 +18,19 @@ class ColumnDataCollection;
 class LogicalOperator;
 class PhysicalPlan;
 
-struct ResultDBYannakakisRelation {
-	//! Bound relation occurrence represented by this working relation.
+struct ResultDBYannakakisSourceColumn {
 	idx_t table_index = DConstants::INVALID_INDEX;
-	//! Source column indexes stored in this working relation, in working-column order.
+	idx_t source_column_index = DConstants::INVALID_INDEX;
+};
+
+struct ResultDBYannakakisRelation {
+	//! Bound relation occurrence represented by this working relation, or INVALID_INDEX for a folded relation.
+	idx_t table_index = DConstants::INVALID_INDEX;
+	//! Bound relation occurrences represented by this working relation.
+	vector<idx_t> table_indices;
+	//! Source columns stored in this working relation, in working-column order.
+	vector<ResultDBYannakakisSourceColumn> source_columns;
+	//! Source column indexes for single-table working relations.
 	vector<idx_t> source_column_indices;
 	//! Working relation output names/types.
 	vector<string> names;
