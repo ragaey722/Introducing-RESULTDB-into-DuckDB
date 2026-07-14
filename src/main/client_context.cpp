@@ -43,11 +43,6 @@
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/column_data_ref.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/operator/logical_column_data_get.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_distinct.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_execute.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/statement_preprocessor.hpp"
@@ -422,27 +417,6 @@ static bool IsExplainAnalyze(SQLStatement *statement) {
 	return explain.explain_type == ExplainType::EXPLAIN_ANALYZE;
 }
 
-static vector<unique_ptr<Expression>> BuildResultDBPhaseColumnRefs(const vector<string> &names,
-                                                                   const vector<LogicalType> &types,
-                                                                   TableIndex table_index) {
-	vector<unique_ptr<Expression>> result;
-	for (idx_t column_idx = 0; column_idx < types.size(); column_idx++) {
-		result.push_back(make_uniq<BoundColumnRefExpression>(
-		    names[column_idx], types[column_idx], ColumnBinding(table_index, ProjectionIndex(column_idx))));
-	}
-	return result;
-}
-
-static unique_ptr<LogicalOperator> BuildResultDBPhaseDistinct(unique_ptr<LogicalOperator> child,
-                                                              const vector<string> &names,
-                                                              const vector<LogicalType> &types,
-                                                              TableIndex table_index) {
-	auto distinct =
-	    make_uniq<LogicalDistinct>(BuildResultDBPhaseColumnRefs(names, types, table_index), DistinctType::DISTINCT);
-	distinct->AddChild(std::move(child));
-	return std::move(distinct);
-}
-
 static vector<vector<std::pair<idx_t, idx_t>>>
 BuildResultDBYannakakisAdjacency(const ResultDBYannakakisProgram &program) {
 	vector<vector<std::pair<idx_t, idx_t>>> adjacency;
@@ -481,82 +455,6 @@ static void BuildResultDBYannakakisOrder(const ResultDBYannakakisProgram &progra
 	D_ASSERT(order.size() == relation_count);
 }
 
-static vector<JoinCondition> BuildResultDBYannakakisConditions(const ResultDBYannakakisProgram &program, idx_t edge_idx,
-                                                               idx_t left_relation, idx_t right_relation,
-                                                               TableIndex left_index, TableIndex right_index) {
-	auto &edge = program.edges[edge_idx];
-	bool same_orientation = edge.left_relation == left_relation && edge.right_relation == right_relation;
-	bool swapped_orientation = edge.left_relation == right_relation && edge.right_relation == left_relation;
-	D_ASSERT(same_orientation || swapped_orientation);
-	auto &left_working = program.relations[left_relation];
-	auto &right_working = program.relations[right_relation];
-
-	vector<JoinCondition> conditions;
-	for (auto &column : edge.columns) {
-		idx_t left_column_index;
-		idx_t right_column_index;
-		if (same_orientation) {
-			left_column_index = column.left_column_index;
-			right_column_index = column.right_column_index;
-		} else {
-			left_column_index = column.right_column_index;
-			right_column_index = column.left_column_index;
-		}
-		auto left_expr = make_uniq<BoundColumnRefExpression>(
-		    left_working.names[left_column_index], left_working.types[left_column_index],
-		    ColumnBinding(left_index, ProjectionIndex(left_column_index)));
-		auto right_expr = make_uniq<BoundColumnRefExpression>(
-		    right_working.names[right_column_index], right_working.types[right_column_index],
-		    ColumnBinding(right_index, ProjectionIndex(right_column_index)));
-		conditions.emplace_back(std::move(left_expr), std::move(right_expr), ExpressionType::COMPARE_EQUAL);
-	}
-	return conditions;
-}
-
-static unique_ptr<LogicalOperator> BuildResultDBCollectionScan(TableIndex table_index, const vector<LogicalType> &types,
-                                                               shared_ptr<ColumnDataCollection> collection) {
-	return make_uniq<LogicalColumnDataGet>(table_index, types, std::move(collection));
-}
-
-static unique_ptr<LogicalOperator>
-BuildResultDBYannakakisSemijoinPhase(const ResultDBYannakakisProgram &program, idx_t edge_idx, idx_t left_relation,
-                                     idx_t right_relation, shared_ptr<ColumnDataCollection> left_collection,
-                                     shared_ptr<ColumnDataCollection> right_collection) {
-	auto &left_working = program.relations[left_relation];
-	auto &right_working = program.relations[right_relation];
-	TableIndex left_index(0);
-	TableIndex right_index(1);
-	auto left_scan = BuildResultDBCollectionScan(left_index, left_working.types, std::move(left_collection));
-	auto right_scan = BuildResultDBCollectionScan(right_index, right_working.types, std::move(right_collection));
-	auto conditions =
-	    BuildResultDBYannakakisConditions(program, edge_idx, left_relation, right_relation, left_index, right_index);
-	auto join = LogicalComparisonJoin::CreateJoin(JoinType::SEMI, JoinRefType::REGULAR, std::move(left_scan),
-	                                             std::move(right_scan), std::move(conditions));
-	return std::move(join);
-}
-
-static unique_ptr<LogicalOperator>
-BuildResultDBYannakakisOutputPhase(const ResultDBYannakakisProgram &program, const ResultDBYannakakisOutputTable &output,
-                                   shared_ptr<ColumnDataCollection> source_collection) {
-	auto &relation = program.relations[output.relation];
-	TableIndex scan_index(0);
-	TableIndex projection_index(1);
-	auto scan = BuildResultDBCollectionScan(scan_index, relation.types, std::move(source_collection));
-
-	vector<unique_ptr<Expression>> expressions;
-	vector<string> names;
-	vector<LogicalType> types;
-	for (auto &column : output.columns) {
-		names.push_back(column.name);
-		types.push_back(column.type);
-		expressions.push_back(make_uniq<BoundColumnRefExpression>(
-		    column.name, column.type, ColumnBinding(scan_index, ProjectionIndex(column.working_column_index))));
-	}
-	auto projection = make_uniq<LogicalProjection>(projection_index, std::move(expressions));
-	projection->AddChild(std::move(scan));
-	return BuildResultDBPhaseDistinct(std::move(projection), names, types, projection_index);
-}
-
 static unique_ptr<PhysicalPlan> PlanResultDBYannakakisPhase(ClientContext &context, Binder &binder,
                                                            unique_ptr<LogicalOperator> logical_plan, bool optimize) {
 	// Each materialization phase is still planned through DuckDB's normal optimizer/physical planner.
@@ -580,46 +478,12 @@ static unique_ptr<PhysicalPlan> PlanResultDBYannakakisPhase(ClientContext &conte
 	return physical_planner.Plan(std::move(logical_plan));
 }
 
-static void AddResultDBPhaseDependency(PreparedResultDBYannakakisPhase &phase, idx_t dependency) {
-	if (dependency == DConstants::INVALID_INDEX) {
-		return;
-	}
-	if (std::find(phase.dependencies.begin(), phase.dependencies.end(), dependency) == phase.dependencies.end()) {
-		phase.dependencies.push_back(dependency);
-	}
-}
-
 static unique_ptr<PreparedResultDBYannakakisProgram>
 PrepareResultDBYannakakisProgram(ClientContext &context, Binder &binder, ResultDBYannakakisProgram &program,
                                  bool optimize) {
-	// Build one shared phase graph: base materialization, bottom-up reductions,
-	// top-down reductions, then per-output projections from the final relation states.
+	// Build one physical base-plan set. The direct collector runs these base plans once and applies the
+	// Yannakakis bottom-up/top-down schedule over shared relation state.
 	auto prepared = make_uniq<PreparedResultDBYannakakisProgram>();
-	vector<idx_t> current_collection(program.relations.size(), DConstants::INVALID_INDEX);
-	vector<idx_t> current_producer(program.relations.size(), DConstants::INVALID_INDEX);
-
-	auto add_collection = [&](const vector<LogicalType> &types) {
-		auto result = prepared->collections.size();
-		prepared->collections.push_back(make_shared_ptr<ColumnDataCollection>(context, types));
-		return result;
-	};
-	auto add_phase = [&](PreparedResultDBYannakakisPhase phase, unique_ptr<LogicalOperator> logical_plan) {
-		auto phase_idx = prepared->phases.size();
-		phase.plan = PlanResultDBYannakakisPhase(context, binder, std::move(logical_plan), optimize);
-		prepared->phases.push_back(std::move(phase));
-		return phase_idx;
-	};
-
-	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
-		auto &relation = program.relations[relation_idx];
-		auto collection_idx = add_collection(relation.types);
-		PreparedResultDBYannakakisPhase phase;
-		phase.type = ResultDBYannakakisPhaseType::BASE;
-		phase.target_collection = collection_idx;
-		auto phase_idx = add_phase(std::move(phase), std::move(relation.base_plan));
-		current_collection[relation_idx] = collection_idx;
-		current_producer[relation_idx] = phase_idx;
-	}
 
 	auto parent = program.parent;
 	auto parent_edge = program.parent_edge;
@@ -629,51 +493,19 @@ PrepareResultDBYannakakisProgram(ClientContext &context, Binder &binder, ResultD
 		BuildResultDBYannakakisOrder(program, adjacency, parent, parent_edge, order);
 	}
 
-	for (idx_t order_offset = order.size(); order_offset > 0; order_offset--) {
-		auto child = order[order_offset - 1];
-		if (child == program.root_relation) {
-			continue;
-		}
-		auto parent_relation = parent[child];
-		auto target_collection = add_collection(program.relations[parent_relation].types);
-		PreparedResultDBYannakakisPhase phase;
-		phase.type = ResultDBYannakakisPhaseType::SEMIJOIN;
-		phase.target_collection = target_collection;
-		AddResultDBPhaseDependency(phase, current_producer[parent_relation]);
-		AddResultDBPhaseDependency(phase, current_producer[child]);
-		auto logical_plan = BuildResultDBYannakakisSemijoinPhase(
-		    program, parent_edge[child], parent_relation, child, prepared->collections[current_collection[parent_relation]],
-		    prepared->collections[current_collection[child]]);
-		auto phase_idx = add_phase(std::move(phase), std::move(logical_plan));
-		current_collection[parent_relation] = target_collection;
-		current_producer[parent_relation] = phase_idx;
-	}
+	prepared->root_relation = program.root_relation;
+	prepared->parent = std::move(parent);
+	prepared->parent_edge = std::move(parent_edge);
+	prepared->order = std::move(order);
+	prepared->edges = std::move(program.edges);
+	prepared->outputs = std::move(program.outputs);
 
-	for (idx_t order_idx = 1; order_idx < order.size(); order_idx++) {
-		auto child = order[order_idx];
-		auto parent_relation = parent[child];
-		auto target_collection = add_collection(program.relations[child].types);
-		PreparedResultDBYannakakisPhase phase;
-		phase.type = ResultDBYannakakisPhaseType::SEMIJOIN;
-		phase.target_collection = target_collection;
-		AddResultDBPhaseDependency(phase, current_producer[child]);
-		AddResultDBPhaseDependency(phase, current_producer[parent_relation]);
-		auto logical_plan = BuildResultDBYannakakisSemijoinPhase(
-		    program, parent_edge[child], child, parent_relation, prepared->collections[current_collection[child]],
-		    prepared->collections[current_collection[parent_relation]]);
-		auto phase_idx = add_phase(std::move(phase), std::move(logical_plan));
-		current_collection[child] = target_collection;
-		current_producer[child] = phase_idx;
-	}
-
-	for (auto &output : program.outputs) {
-		PreparedResultDBYannakakisPhase phase;
-		phase.type = ResultDBYannakakisPhaseType::OUTPUT;
-		phase.output_table_index = output.table_metadata_index;
-		AddResultDBPhaseDependency(phase, current_producer[output.relation]);
-		auto logical_plan =
-		    BuildResultDBYannakakisOutputPhase(program, output, prepared->collections[current_collection[output.relation]]);
-		add_phase(std::move(phase), std::move(logical_plan));
+	prepared->relations.reserve(program.relations.size());
+	prepared->base_plans.reserve(program.relations.size());
+	for (auto &relation : program.relations) {
+		prepared->base_plans.push_back(
+		    PlanResultDBYannakakisPhase(context, binder, std::move(relation.base_plan), optimize));
+		prepared->relations.push_back(std::move(relation));
 	}
 	return prepared;
 }

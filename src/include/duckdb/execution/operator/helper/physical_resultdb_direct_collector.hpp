@@ -39,9 +39,9 @@ public:
 
 private:
 	const PreparedResultDBYannakakisProgram &program;
-	vector<reference<PhysicalOperator>> phase_plans;
+	vector<reference<PhysicalOperator>> base_plans;
 	// Raw pipeline pointers are valid for the executor lifetime; the meta-pipeline graph owns the pipelines.
-	mutable unordered_map<const Pipeline *, idx_t> pipeline_phase_map;
+	mutable unordered_map<const Pipeline *, idx_t> pipeline_relation_map;
 };
 
 } // namespace duckdb

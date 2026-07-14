@@ -547,6 +547,88 @@ TEST_CASE("Test ResultDB decompose deduplicates duplicate rows with NULL values"
 	REQUIRE(!result->next);
 }
 
+TEST_CASE("Test ResultDB semijoin physical executor handles NULL keys and parallel base scans", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE a(id INTEGER, label VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE b(id INTEGER, a_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO a VALUES (1, 'keep'), (NULL, 'null-key'), (2, 'drop')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO b VALUES (10, 1), (20, NULL)"));
+
+	const string null_key_from = " FROM a JOIN b ON a.id = b.a_id";
+	auto expected_a = con.Query("SELECT DISTINCT a.id, a.label" + null_key_from);
+	auto expected_b = con.Query("SELECT DISTINCT b.id, b.a_id" + null_key_from);
+	REQUIRE(!expected_a->HasError());
+	REQUIRE(!expected_b->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + null_key_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	RequireResultDBTable(*result, "a", *expected_a);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "b", *expected_b);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	REQUIRE(!result->next);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE ck_a(k1 INTEGER, k2 INTEGER, label VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE ck_b(k1 INTEGER, k2 INTEGER, label VARCHAR)"));
+	REQUIRE_NO_FAIL(
+	    con.Query("INSERT INTO ck_a VALUES (1, 1, 'keep'), (1, 2, 'partial'), (2, 1, 'drop'), (NULL, 1, 'null-a')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO ck_b VALUES (1, 1, 'match'), (1, 3, 'partial'), (NULL, 1, 'null-b')"));
+
+	const string composite_key_from = " FROM ck_a JOIN ck_b ON ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2";
+	auto expected_ck_a = con.Query("SELECT DISTINCT ck_a.k1, ck_a.k2, ck_a.label" + composite_key_from);
+	auto expected_ck_b = con.Query("SELECT DISTINCT ck_b.k1, ck_b.k2, ck_b.label" + composite_key_from);
+	REQUIRE(!expected_ck_a->HasError());
+	REQUIRE(!expected_ck_b->HasError());
+
+	result = con.Query("SELECT RESULTDB *" + composite_key_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	RequireResultDBTable(*result, "ck_a", *expected_ck_a);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "ck_b", *expected_ck_b);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	REQUIRE(!result->next);
+
+	REQUIRE_NO_FAIL(con.Query("PRAGMA threads=4"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE pa AS SELECT i::INTEGER id FROM range(0, 1000) tbl(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE pb AS SELECT i::INTEGER id, i::INTEGER a_id "
+	                          "FROM range(0, 1000) tbl(i) WHERE i % 2 = 0"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE pc AS SELECT i::INTEGER id, i::INTEGER b_id "
+	                          "FROM range(0, 1000) tbl(i) WHERE i % 4 = 0"));
+
+	const string parallel_from =
+	    " FROM pa JOIN pb ON pa.id = pb.a_id JOIN pc ON pb.id = pc.b_id";
+	auto expected_pa = con.Query("SELECT DISTINCT pa.id" + parallel_from);
+	auto expected_pb = con.Query("SELECT DISTINCT pb.id, pb.a_id" + parallel_from);
+	auto expected_pc = con.Query("SELECT DISTINCT pc.id, pc.b_id" + parallel_from);
+	REQUIRE(!expected_pa->HasError());
+	REQUIRE(!expected_pb->HasError());
+	REQUIRE(!expected_pc->HasError());
+
+	result = con.Query("SELECT RESULTDB *" + parallel_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	RequireResultDBTable(*result, "pa", *expected_pa);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 250);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "pb", *expected_pb);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 250);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "pc", *expected_pc);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 250);
+	REQUIRE(!result->next);
+}
+
 TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);

@@ -9,12 +9,10 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
-#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
 
-class ColumnDataCollection;
 class LogicalOperator;
 class PhysicalPlan;
 
@@ -72,21 +70,16 @@ struct ResultDBYannakakisProgram {
 	vector<ResultDBYannakakisOutputTable> outputs;
 };
 
-enum class ResultDBYannakakisPhaseType : uint8_t { BASE, SEMIJOIN, OUTPUT };
-
-struct PreparedResultDBYannakakisPhase {
-	ResultDBYannakakisPhaseType type = ResultDBYannakakisPhaseType::BASE;
-	idx_t target_collection = DConstants::INVALID_INDEX;
-	idx_t output_table_index = DConstants::INVALID_INDEX;
-	vector<idx_t> dependencies;
-	unique_ptr<PhysicalPlan> plan;
-};
-
 struct PreparedResultDBYannakakisProgram {
-	//! Shared materialized phase outputs. LogicalColumnDataGet scans hold shared_ptrs to these collections; the
-	//! direct collector resets and reuses them at execution start, so the prepared program is not re-entrant.
-	vector<shared_ptr<ColumnDataCollection>> collections;
-	vector<PreparedResultDBYannakakisPhase> phases;
+	idx_t root_relation = DConstants::INVALID_INDEX;
+	vector<idx_t> parent;
+	vector<idx_t> parent_edge;
+	vector<idx_t> order;
+	vector<ResultDBYannakakisRelation> relations;
+	vector<ResultDBYannakakisEdge> edges;
+	vector<ResultDBYannakakisOutputTable> outputs;
+	//! Physical plans that materialize each base/folded relation once before in-memory Yannakakis reduction.
+	vector<unique_ptr<PhysicalPlan>> base_plans;
 };
 
 } // namespace duckdb
