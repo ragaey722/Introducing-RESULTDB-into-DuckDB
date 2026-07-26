@@ -18,6 +18,7 @@
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -60,6 +61,17 @@ struct ResultDBSemijoinGraph {
 	vector<ResultDBSemijoinGraphEdge> edges;
 	unordered_map<idx_t, idx_t> node_map;
 	string unsupported_reason;
+};
+
+struct ResultDBColumnKey {
+	idx_t table_index = DConstants::INVALID_INDEX;
+	idx_t column_index = DConstants::INVALID_INDEX;
+};
+
+struct ResultDBCanonicalJoinCondition {
+	const JoinCondition *condition;
+	idx_t left_column = DConstants::INVALID_INDEX;
+	idx_t right_column = DConstants::INVALID_INDEX;
 };
 
 static bool TryGetSingleResultDBTable(LogicalOperator &op, TableIndex &table_index) {
@@ -284,6 +296,81 @@ static void StoreResultDBJoinMetadata(ResultDBProperties &properties, const Resu
 		}
 		properties.join_edges.push_back(std::move(edge_metadata));
 	}
+}
+
+static bool SameResultDBColumnKey(const ResultDBColumnKey &left, const ResultDBColumnKey &right) {
+	return left.table_index == right.table_index && left.column_index == right.column_index;
+}
+
+static idx_t GetOrCreateResultDBColumnKey(vector<ResultDBColumnKey> &columns,
+                                          const BoundColumnRefExpression &colref) {
+	ResultDBColumnKey key;
+	key.table_index = colref.binding.table_index.index;
+	key.column_index = colref.binding.column_index.GetIndex();
+	auto entry = std::find_if(columns.begin(), columns.end(), [&](const ResultDBColumnKey &candidate) {
+		return SameResultDBColumnKey(candidate, key);
+	});
+	if (entry != columns.end()) {
+		return NumericCast<idx_t>(entry - columns.begin());
+	}
+	auto result = columns.size();
+	columns.push_back(key);
+	return result;
+}
+
+static idx_t FindResultDBUnionParent(vector<idx_t> &parents, idx_t entry) {
+	if (parents[entry] == entry) {
+		return entry;
+	}
+	parents[entry] = FindResultDBUnionParent(parents, parents[entry]);
+	return parents[entry];
+}
+
+static bool UnionResultDBColumns(vector<idx_t> &parents, idx_t left, idx_t right) {
+	auto left_parent = FindResultDBUnionParent(parents, left);
+	auto right_parent = FindResultDBUnionParent(parents, right);
+	if (left_parent == right_parent) {
+		return false;
+	}
+	if (left_parent > right_parent) {
+		std::swap(left_parent, right_parent);
+	}
+	parents[right_parent] = left_parent;
+	return true;
+}
+
+static void CanonicalizeResultDBJoinConditions(ResultDBSemijoinAnalysis &analysis) {
+	vector<ResultDBColumnKey> columns;
+	vector<ResultDBCanonicalJoinCondition> conditions;
+	for (auto &edge : analysis.edges) {
+		for (auto &condition : edge.conditions) {
+			auto &left_colref = condition.GetLHS().Cast<BoundColumnRefExpression>();
+			auto &right_colref = condition.GetRHS().Cast<BoundColumnRefExpression>();
+			ResultDBCanonicalJoinCondition entry;
+			entry.condition = &condition;
+			entry.left_column = GetOrCreateResultDBColumnKey(columns, left_colref);
+			entry.right_column = GetOrCreateResultDBColumnKey(columns, right_colref);
+			conditions.push_back(entry);
+		}
+	}
+
+	vector<idx_t> parents;
+	parents.reserve(columns.size());
+	for (idx_t column_idx = 0; column_idx < columns.size(); column_idx++) {
+		parents.push_back(column_idx);
+	}
+
+	ResultDBSemijoinAnalysis canonical;
+	for (auto &condition : conditions) {
+		if (!UnionResultDBColumns(parents, condition.left_column, condition.right_column)) {
+			continue;
+		}
+		if (!AddResultDBJoinCondition(canonical, *condition.condition)) {
+			throw InternalException("ResultDB canonical join condition became unsupported: %s",
+			                        canonical.unsupported_reason);
+		}
+	}
+	analysis.edges = std::move(canonical.edges);
 }
 
 static bool ResultDBNodeContainsTable(const ResultDBSemijoinGraphNode &node, idx_t table_index) {
@@ -891,6 +978,84 @@ BuildResultDBYannakakisProgram(Binder &binder, ResultDBSemijoinAnalysis &analysi
 	return program;
 }
 
+static LogicalType GetResultDBEmptySourceColumnType(const ResultDBTableMetadata &table, idx_t source_idx) {
+	for (auto &column : table.columns) {
+		if (column.source_column_index == source_idx) {
+			return column.type;
+		}
+	}
+	throw InternalException("ResultDB empty relation is missing output column type");
+}
+
+static unique_ptr<LogicalOperator> BuildResultDBEmptyRelationPlan(Binder &binder,
+                                                                  const ResultDBYannakakisRelation &relation) {
+	auto table_index = binder.GenerateTableIndex();
+	vector<ColumnBinding> bindings;
+	bindings.reserve(relation.types.size());
+	for (idx_t column_idx = 0; column_idx < relation.types.size(); column_idx++) {
+		bindings.emplace_back(table_index, ProjectionIndex(column_idx));
+	}
+	return make_uniq<LogicalEmptyResult>(relation.types, std::move(bindings));
+}
+
+static unique_ptr<ResultDBYannakakisProgram> BuildResultDBEmptyYannakakisProgram(Binder &binder) {
+	auto &properties = binder.GetStatementProperties();
+	auto program = make_uniq<ResultDBYannakakisProgram>();
+	auto relation_count = properties.resultdb.tables.size();
+	program->root_relation = relation_count == 0 ? DConstants::INVALID_INDEX : 0;
+	program->parent.assign(relation_count, DConstants::INVALID_INDEX);
+	program->parent_edge.assign(relation_count, DConstants::INVALID_INDEX);
+	program->relations.resize(relation_count);
+
+	vector<vector<ResultDBYannakakisSourceColumn>> needed_columns(relation_count);
+	for (idx_t table_metadata_idx = 0; table_metadata_idx < relation_count; table_metadata_idx++) {
+		auto &table = properties.resultdb.tables[table_metadata_idx];
+		for (auto &column : table.columns) {
+			if (column.source_column_index == DConstants::INVALID_INDEX) {
+				throw InternalException("ResultDB semijoin column metadata is missing source_column_index");
+			}
+			AddResultDBWorkingColumn(needed_columns, table_metadata_idx, table.table_index,
+			                         column.source_column_index);
+		}
+	}
+
+	for (idx_t table_metadata_idx = 0; table_metadata_idx < relation_count; table_metadata_idx++) {
+		auto &table = properties.resultdb.tables[table_metadata_idx];
+		auto &relation = program->relations[table_metadata_idx];
+		relation.table_index = table.table_index;
+		relation.table_indices.push_back(table.table_index);
+		SortResultDBSourceColumns(needed_columns[table_metadata_idx]);
+		relation.source_columns = std::move(needed_columns[table_metadata_idx]);
+		for (auto &source_column : relation.source_columns) {
+			relation.source_column_indices.push_back(source_column.source_column_index);
+			relation.names.push_back(StringUtil::Format("resultdb_empty_%llu_%llu", source_column.table_index,
+			                                            source_column.source_column_index));
+			relation.types.push_back(GetResultDBEmptySourceColumnType(table, source_column.source_column_index));
+		}
+		relation.base_plan = BuildResultDBEmptyRelationPlan(binder, relation);
+		program->order.push_back(table_metadata_idx);
+	}
+
+	program->outputs.reserve(relation_count);
+	for (idx_t table_metadata_idx = 0; table_metadata_idx < relation_count; table_metadata_idx++) {
+		auto &table = properties.resultdb.tables[table_metadata_idx];
+		ResultDBYannakakisOutputTable output_table;
+		output_table.relation = table_metadata_idx;
+		output_table.table_metadata_index = table_metadata_idx;
+		for (auto &column : table.columns) {
+			ResultDBYannakakisOutputColumn output_column;
+			output_column.working_column_index =
+			    GetResultDBWorkingColumnIndex(program->relations[output_table.relation].source_columns,
+			                                  table.table_index, column.source_column_index);
+			output_column.name = column.name;
+			output_column.type = column.type;
+			output_table.columns.push_back(std::move(output_column));
+		}
+		program->outputs.push_back(std::move(output_table));
+	}
+	return program;
+}
+
 ResultDBYannakakisOptimizer::ResultDBYannakakisOptimizer(Binder &binder, ClientContext &context)
     : binder(binder), context(context) {
 }
@@ -909,6 +1074,12 @@ ResultDBYannakakisOptimizer::Optimize(unique_ptr<LogicalOperator> plan,
 		return plan;
 	}
 
+	if (plan->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+		resultdb_yannakakis_program = BuildResultDBEmptyYannakakisProgram(binder);
+		properties.resultdb.execution_strategy = ResultDBStrategy::SEMIJOIN;
+		return make_uniq_base<LogicalOperator, LogicalDummyScan>(binder.GenerateTableIndex());
+	}
+
 	ResultDBSemijoinAnalysis analysis;
 	if (!AnalyzeResultDBSemijoin(*plan, analysis, context)) {
 		if (properties.resultdb.requested_strategy == ResultDBStrategy::AUTO) {
@@ -917,6 +1088,7 @@ ResultDBYannakakisOptimizer::Optimize(unique_ptr<LogicalOperator> plan,
 		throw BinderException("RESULTDB semijoin strategy does not support this query: %s",
 		                      analysis.unsupported_reason);
 	}
+	CanonicalizeResultDBJoinConditions(analysis);
 
 	vector<idx_t> parent;
 	vector<idx_t> parent_edge;

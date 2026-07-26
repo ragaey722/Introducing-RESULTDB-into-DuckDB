@@ -249,6 +249,9 @@ static void ExecuteResultDBDirectReduction(ClientContext &context, QueryResultMe
                                            const PhysicalOperator &op,
                                            const PreparedResultDBYannakakisProgram &program,
                                            vector<unique_ptr<ColumnDataCollection>> &relations) {
+	if (program.edges.empty()) {
+		return;
+	}
 	if (program.order.empty()) {
 		throw InternalException("ResultDB Yannakakis program is missing relation order");
 	}

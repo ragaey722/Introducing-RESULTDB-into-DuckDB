@@ -182,12 +182,6 @@ void Optimizer::RunBuiltInOptimizers() {
 		plan = filter_pullup.Rewrite(std::move(plan));
 	});
 
-	ResultDBYannakakisOptimizer resultdb_yannakakis_optimizer(binder, context);
-	plan = resultdb_yannakakis_optimizer.Optimize(std::move(plan), resultdb_yannakakis_program);
-	if (resultdb_yannakakis_program) {
-		return;
-	}
-
 	// perform filter pushdown
 	RunOptimizer(OptimizerType::FILTER_PUSHDOWN, [&]() {
 		FilterPushdown filter_pushdown(*this);
@@ -206,6 +200,12 @@ void Optimizer::RunBuiltInOptimizers() {
 		RegexRangeFilter regex_opt;
 		plan = regex_opt.Rewrite(std::move(plan));
 	});
+
+	ResultDBYannakakisOptimizer resultdb_yannakakis_optimizer(binder, context);
+	plan = resultdb_yannakakis_optimizer.Optimize(std::move(plan), resultdb_yannakakis_program);
+	if (resultdb_yannakakis_program) {
+		return;
+	}
 
 	RunOptimizer(OptimizerType::IN_CLAUSE, [&]() {
 		InClauseRewriter ic_rewriter(context, *this);

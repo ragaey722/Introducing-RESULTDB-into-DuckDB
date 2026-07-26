@@ -706,6 +706,63 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	REQUIRE(!result->HasError());
 	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
 
+	const string selective_filter_from = " FROM a JOIN b ON a.id = b.a_id WHERE a.id = 1";
+	auto expected_selective_a = con.Query("SELECT DISTINCT a.id" + selective_filter_from);
+	auto expected_selective_b = con.Query("SELECT DISTINCT b.id, b.a_id" + selective_filter_from);
+	REQUIRE(!expected_selective_a->HasError());
+	REQUIRE(!expected_selective_b->HasError());
+	result = con.Query("SELECT RESULTDB *" + selective_filter_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 1);
+	RequireResultDBTable(*result, "a", *expected_selective_a);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "b", *expected_selective_b);
+	REQUIRE(!result->next);
+
+	const string transitive_filter_from =
+	    " FROM a JOIN b ON a.id = b.a_id JOIN c ON b.a_id = c.a_id WHERE a.id = 1";
+	auto expected_transitive_a = con.Query("SELECT DISTINCT a.id" + transitive_filter_from);
+	auto expected_transitive_b = con.Query("SELECT DISTINCT b.id, b.a_id" + transitive_filter_from);
+	auto expected_transitive_c = con.Query("SELECT DISTINCT c.id, c.b_id, c.a_id, c.note" + transitive_filter_from);
+	REQUIRE(!expected_transitive_a->HasError());
+	REQUIRE(!expected_transitive_b->HasError());
+	REQUIRE(!expected_transitive_c->HasError());
+	result = con.Query("SELECT RESULTDB *" + transitive_filter_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 2);
+	RequireResultDBTable(*result, "a", *expected_transitive_a);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "b", *expected_transitive_b);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "c", *expected_transitive_c);
+	REQUIRE(!result->next);
+
+	const string redundant_equality_from =
+	    " FROM a JOIN b ON a.id = b.a_id JOIN c ON b.a_id = c.a_id AND a.id = c.a_id";
+	auto expected_redundant_a = con.Query("SELECT DISTINCT a.id" + redundant_equality_from);
+	auto expected_redundant_b = con.Query("SELECT DISTINCT b.id, b.a_id" + redundant_equality_from);
+	auto expected_redundant_c = con.Query("SELECT DISTINCT c.id, c.b_id, c.a_id, c.note" + redundant_equality_from);
+	REQUIRE(!expected_redundant_a->HasError());
+	REQUIRE(!expected_redundant_b->HasError());
+	REQUIRE(!expected_redundant_c->HasError());
+	result = con.Query("SELECT RESULTDB *" + redundant_equality_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 2);
+	RequireResultDBTable(*result, "a", *expected_redundant_a);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "b", *expected_redundant_b);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "c", *expected_redundant_c);
+	REQUIRE(!result->next);
+
 	const string cross_table_non_equality_where_from = " FROM a JOIN b ON a.id = b.a_id WHERE a.id < b.a_id";
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
 	result = con.Query("SELECT RESULTDB *" + cross_table_non_equality_where_from);
@@ -720,11 +777,46 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	result = con.Query("SELECT RESULTDB * FROM a JOIN b ON a.id = b.a_id WHERE 1 = 0");
 	REQUIRE(!result->HasError());
 	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.empty());
 	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 0);
 	duckdb::unique_ptr<QueryResult> next_result = std::move(result->next);
 	REQUIRE(next_result);
 	REQUIRE(next_result->Cast<MaterializedQueryResult>().RowCount() == 0);
 	REQUIRE(!next_result->next);
+
+	auto require_empty_semijoin = [&](const string &from_clause) {
+		result = con.Query("SELECT RESULTDB *" + from_clause);
+		REQUIRE(!result->HasError());
+		RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+		REQUIRE(result->properties.resultdb.join_edges.empty());
+		REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 0);
+		next_result = std::move(result->next);
+		REQUIRE(next_result);
+		REQUIRE(next_result->Cast<MaterializedQueryResult>().RowCount() == 0);
+		REQUIRE(!next_result->next);
+	};
+	require_empty_semijoin(" FROM a JOIN b ON a.id = b.a_id WHERE NULL");
+	require_empty_semijoin(" FROM a JOIN b ON a.id = b.a_id WHERE a.id = 1 AND a.id = 2");
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE words(id INTEGER, name VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE word_hits(id INTEGER, word_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO words VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Alan')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO word_hits VALUES (10, 1), (20, 2), (30, 3)"));
+	const string regex_from =
+	    " FROM words w JOIN word_hits h ON w.id = h.word_id WHERE regexp_full_match(w.name, 'A.*')";
+	auto expected_regex_words = con.Query("SELECT DISTINCT w.id, w.name" + regex_from);
+	auto expected_regex_hits = con.Query("SELECT DISTINCT h.id, h.word_id" + regex_from);
+	REQUIRE(!expected_regex_words->HasError());
+	REQUIRE(!expected_regex_hits->HasError());
+	result = con.Query("SELECT RESULTDB *" + regex_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 1);
+	RequireResultDBTable(*result, "w", *expected_regex_words);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "h", *expected_regex_hits);
+	REQUIRE(!result->next);
 }
 
 TEST_CASE("Test ResultDB query returns larger source relation set", "[api]") {
