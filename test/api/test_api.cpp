@@ -629,6 +629,33 @@ TEST_CASE("Test ResultDB semijoin physical executor handles NULL keys and parall
 	REQUIRE(!result->next);
 }
 
+TEST_CASE("Test ResultDB semijoin materializes casted equality join keys", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE cast_left(id INTEGER, label VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE cast_right(id INTEGER, left_id DOUBLE)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO cast_left VALUES (1, 'keep'), (2, 'drop')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO cast_right VALUES (10, 1.0), (20, 2.5), (30, NULL)"));
+
+	const string cast_key_from = " FROM cast_left l JOIN cast_right r ON l.id = r.left_id";
+	auto expected_left = con.Query("SELECT DISTINCT l.label" + cast_key_from);
+	auto expected_right = con.Query("SELECT DISTINCT r.id" + cast_key_from);
+	REQUIRE(!expected_left->HasError());
+	REQUIRE(!expected_right->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB l.label, r.id" + cast_key_from);
+	REQUIRE(!result->HasError());
+	RequireResultDBTable(*result, "l", *expected_left);
+	REQUIRE(CHECK_COLUMN(result, 0, {"keep"}));
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "r", *expected_right);
+	REQUIRE(CHECK_COLUMN(result, 0, {10}));
+	REQUIRE(!result->next);
+}
+
 TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);

@@ -12,6 +12,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -66,6 +67,7 @@ struct ResultDBSemijoinGraph {
 struct ResultDBColumnKey {
 	idx_t table_index = DConstants::INVALID_INDEX;
 	idx_t column_index = DConstants::INVALID_INDEX;
+	LogicalType comparison_type = LogicalType::INVALID;
 };
 
 struct ResultDBCanonicalJoinCondition {
@@ -73,6 +75,37 @@ struct ResultDBCanonicalJoinCondition {
 	idx_t left_column = DConstants::INVALID_INDEX;
 	idx_t right_column = DConstants::INVALID_INDEX;
 };
+
+struct ResultDBJoinColumnRef {
+	const BoundColumnRefExpression *column = nullptr;
+	LogicalType comparison_type = LogicalType::INVALID;
+	bool requires_cast = false;
+};
+
+static bool TryGetResultDBJoinColumnRef(const Expression &expr, ResultDBJoinColumnRef &result) {
+	result = ResultDBJoinColumnRef();
+	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+		auto &column = expr.Cast<BoundColumnRefExpression>();
+		result.column = &column;
+		result.comparison_type = column.GetReturnType();
+		return true;
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+		return false;
+	}
+	auto &cast = expr.Cast<BoundCastExpression>();
+	if (cast.try_cast || cast.child->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	result.column = &cast.child->Cast<BoundColumnRefExpression>();
+	result.comparison_type = cast.GetReturnType();
+	result.requires_cast = result.column->GetReturnType() != result.comparison_type;
+	return true;
+}
+
+static LogicalType GetResultDBJoinColumnCastType(const ResultDBJoinColumnRef &column) {
+	return column.requires_cast ? column.comparison_type : LogicalType::INVALID;
+}
 
 static bool TryGetSingleResultDBTable(LogicalOperator &op, TableIndex &table_index) {
 	unordered_set<TableIndex> bindings;
@@ -128,13 +161,20 @@ static bool AddResultDBJoinCondition(ResultDBSemijoinAnalysis &analysis, const J
 		analysis.unsupported_reason = "semijoin currently supports only equality join predicates";
 		return false;
 	}
-	if (condition.GetLHS().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
-	    condition.GetRHS().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
-		analysis.unsupported_reason = "semijoin join predicates must compare source columns directly";
+	ResultDBJoinColumnRef left;
+	ResultDBJoinColumnRef right;
+	if (!TryGetResultDBJoinColumnRef(condition.GetLHS(), left) ||
+	    !TryGetResultDBJoinColumnRef(condition.GetRHS(), right)) {
+		analysis.unsupported_reason =
+		    "semijoin join predicates must compare source columns with optional direct casts";
 		return false;
 	}
-	auto &left_colref = condition.GetLHS().Cast<BoundColumnRefExpression>();
-	auto &right_colref = condition.GetRHS().Cast<BoundColumnRefExpression>();
+	if (left.comparison_type != right.comparison_type) {
+		analysis.unsupported_reason = "semijoin join predicate comparison types do not match";
+		return false;
+	}
+	auto &left_colref = *left.column;
+	auto &right_colref = *right.column;
 	if (left_colref.depth > 0 || right_colref.depth > 0) {
 		analysis.unsupported_reason = "semijoin does not support correlated join predicates";
 		return false;
@@ -287,11 +327,15 @@ static void StoreResultDBJoinMetadata(ResultDBProperties &properties, const Resu
 		edge_metadata.left_table_index = edge.left_table.index;
 		edge_metadata.right_table_index = edge.right_table.index;
 		for (auto &condition : edge.conditions) {
-			auto &left_colref = condition.GetLHS().Cast<BoundColumnRefExpression>();
-			auto &right_colref = condition.GetRHS().Cast<BoundColumnRefExpression>();
+			ResultDBJoinColumnRef left;
+			ResultDBJoinColumnRef right;
+			if (!TryGetResultDBJoinColumnRef(condition.GetLHS(), left) ||
+			    !TryGetResultDBJoinColumnRef(condition.GetRHS(), right)) {
+				throw InternalException("ResultDB join metadata contains an invalid join column");
+			}
 			ResultDBJoinColumnMetadata column_metadata;
-			column_metadata.left_column_index = left_colref.binding.column_index.GetIndex();
-			column_metadata.right_column_index = right_colref.binding.column_index.GetIndex();
+			column_metadata.left_column_index = left.column->binding.column_index.GetIndex();
+			column_metadata.right_column_index = right.column->binding.column_index.GetIndex();
 			edge_metadata.columns.push_back(column_metadata);
 		}
 		properties.join_edges.push_back(std::move(edge_metadata));
@@ -299,14 +343,15 @@ static void StoreResultDBJoinMetadata(ResultDBProperties &properties, const Resu
 }
 
 static bool SameResultDBColumnKey(const ResultDBColumnKey &left, const ResultDBColumnKey &right) {
-	return left.table_index == right.table_index && left.column_index == right.column_index;
+	return left.table_index == right.table_index && left.column_index == right.column_index &&
+	       left.comparison_type == right.comparison_type;
 }
 
-static idx_t GetOrCreateResultDBColumnKey(vector<ResultDBColumnKey> &columns,
-                                          const BoundColumnRefExpression &colref) {
+static idx_t GetOrCreateResultDBColumnKey(vector<ResultDBColumnKey> &columns, const ResultDBJoinColumnRef &column) {
 	ResultDBColumnKey key;
-	key.table_index = colref.binding.table_index.index;
-	key.column_index = colref.binding.column_index.GetIndex();
+	key.table_index = column.column->binding.table_index.index;
+	key.column_index = column.column->binding.column_index.GetIndex();
+	key.comparison_type = column.comparison_type;
 	auto entry = std::find_if(columns.begin(), columns.end(), [&](const ResultDBColumnKey &candidate) {
 		return SameResultDBColumnKey(candidate, key);
 	});
@@ -344,12 +389,16 @@ static void CanonicalizeResultDBJoinConditions(ResultDBSemijoinAnalysis &analysi
 	vector<ResultDBCanonicalJoinCondition> conditions;
 	for (auto &edge : analysis.edges) {
 		for (auto &condition : edge.conditions) {
-			auto &left_colref = condition.GetLHS().Cast<BoundColumnRefExpression>();
-			auto &right_colref = condition.GetRHS().Cast<BoundColumnRefExpression>();
+			ResultDBJoinColumnRef left;
+			ResultDBJoinColumnRef right;
+			if (!TryGetResultDBJoinColumnRef(condition.GetLHS(), left) ||
+			    !TryGetResultDBJoinColumnRef(condition.GetRHS(), right)) {
+				throw InternalException("ResultDB canonicalization contains an invalid join column");
+			}
 			ResultDBCanonicalJoinCondition entry;
 			entry.condition = &condition;
-			entry.left_column = GetOrCreateResultDBColumnKey(columns, left_colref);
-			entry.right_column = GetOrCreateResultDBColumnKey(columns, right_colref);
+			entry.left_column = GetOrCreateResultDBColumnKey(columns, left);
+			entry.right_column = GetOrCreateResultDBColumnKey(columns, right);
 			conditions.push_back(entry);
 		}
 	}
@@ -420,10 +469,15 @@ static ResultDBSemijoinGraphEdge &GetResultDBGraphEdge(ResultDBSemijoinGraph &gr
 static bool AddResultDBGraphCondition(ResultDBSemijoinGraph &graph, ResultDBSemijoinGraphEdge &edge,
                                       const JoinCondition &condition) {
 	auto copied_condition = condition.Copy();
-	auto &left_colref = copied_condition.GetLHS().Cast<BoundColumnRefExpression>();
-	auto &right_colref = copied_condition.GetRHS().Cast<BoundColumnRefExpression>();
-	auto left_table = left_colref.binding.table_index.index;
-	auto right_table = right_colref.binding.table_index.index;
+	ResultDBJoinColumnRef left;
+	ResultDBJoinColumnRef right;
+	if (!TryGetResultDBJoinColumnRef(copied_condition.GetLHS(), left) ||
+	    !TryGetResultDBJoinColumnRef(copied_condition.GetRHS(), right)) {
+		graph.unsupported_reason = "semijoin join graph contains an invalid join column";
+		return false;
+	}
+	auto left_table = left.column->binding.table_index.index;
+	auto right_table = right.column->binding.table_index.index;
 	bool lhs_in_left = ResultDBNodeContainsTable(graph.nodes[edge.left_node], left_table);
 	bool rhs_in_right = ResultDBNodeContainsTable(graph.nodes[edge.right_node], right_table);
 	bool lhs_in_right = ResultDBNodeContainsTable(graph.nodes[edge.right_node], left_table);
@@ -718,14 +772,17 @@ static vector<unique_ptr<Expression>> BuildResultDBDistinctTargets(const vector<
 
 static bool SameResultDBSourceColumn(const ResultDBYannakakisSourceColumn &left,
                                      const ResultDBYannakakisSourceColumn &right) {
-	return left.table_index == right.table_index && left.source_column_index == right.source_column_index;
+	return left.table_index == right.table_index && left.source_column_index == right.source_column_index &&
+	       left.cast_type == right.cast_type;
 }
 
 static void AddResultDBWorkingColumn(vector<vector<ResultDBYannakakisSourceColumn>> &needed_columns, idx_t relation_pos,
-                                     idx_t table_index, idx_t source_idx) {
+                                     idx_t table_index, idx_t source_idx,
+                                     const LogicalType &cast_type = LogicalType::INVALID) {
 	ResultDBYannakakisSourceColumn source_column;
 	source_column.table_index = table_index;
 	source_column.source_column_index = source_idx;
+	source_column.cast_type = cast_type;
 	auto &columns = needed_columns[relation_pos];
 	auto entry = std::find_if(columns.begin(), columns.end(), [&](const ResultDBYannakakisSourceColumn &current) {
 		return SameResultDBSourceColumn(current, source_column);
@@ -741,17 +798,22 @@ static void SortResultDBSourceColumns(vector<ResultDBYannakakisSourceColumn> &co
 		          if (left.table_index != right.table_index) {
 			          return left.table_index < right.table_index;
 		          }
-		          return left.source_column_index < right.source_column_index;
+		          if (left.source_column_index != right.source_column_index) {
+			          return left.source_column_index < right.source_column_index;
+		          }
+		          return left.cast_type.ToString() < right.cast_type.ToString();
 	          });
 	columns.erase(std::unique(columns.begin(), columns.end(), SameResultDBSourceColumn), columns.end());
 }
 
 static idx_t GetResultDBWorkingColumnIndex(const vector<ResultDBYannakakisSourceColumn> &source_columns,
-                                           idx_t table_index, idx_t source_idx) {
+                                           idx_t table_index, idx_t source_idx,
+                                           const LogicalType &cast_type = LogicalType::INVALID) {
 	auto entry = std::find_if(source_columns.begin(), source_columns.end(),
 	                          [&](const ResultDBYannakakisSourceColumn &source_column) {
 		                          return source_column.table_index == table_index &&
-		                                 source_column.source_column_index == source_idx;
+		                                 source_column.source_column_index == source_idx &&
+		                                 source_column.cast_type == cast_type;
 	                          });
 	if (entry == source_columns.end()) {
 		throw InternalException("ResultDB Yannakakis working relation is missing a required source column");
@@ -791,10 +853,14 @@ CollectResultDBInternalJoinConditions(const ResultDBSemijoinAnalysis &analysis, 
 	for (auto &edge : analysis.edges) {
 		for (auto &condition : edge.conditions) {
 			auto copied_condition = condition.Copy();
-			auto &left_colref = copied_condition.GetLHS().Cast<BoundColumnRefExpression>();
-			auto &right_colref = copied_condition.GetRHS().Cast<BoundColumnRefExpression>();
-			auto left_table = left_colref.binding.table_index.index;
-			auto condition_right_table = right_colref.binding.table_index.index;
+			ResultDBJoinColumnRef left;
+			ResultDBJoinColumnRef right;
+			if (!TryGetResultDBJoinColumnRef(copied_condition.GetLHS(), left) ||
+			    !TryGetResultDBJoinColumnRef(copied_condition.GetRHS(), right)) {
+				throw InternalException("ResultDB folded join contains an invalid join column");
+			}
+			auto left_table = left.column->binding.table_index.index;
+			auto condition_right_table = right.column->binding.table_index.index;
 			if (ResultDBTableSetContains(left_tables, left_table) && condition_right_table == right_table) {
 				conditions.push_back(std::move(copied_condition));
 				continue;
@@ -851,15 +917,20 @@ static unique_ptr<LogicalOperator> BuildResultDBNodeMaterializationPlan(Binder &
 	vector<unique_ptr<Expression>> projection_expressions;
 	for (idx_t working_idx = 0; working_idx < relation.source_columns.size(); working_idx++) {
 		auto &source_column = relation.source_columns[working_idx];
-		auto type =
+		auto source_type =
 		    GetResultDBSourceColumnType(analysis, source_column.table_index, source_column.source_column_index);
-		auto name = StringUtil::Format("resultdb_%llu_%llu", source_column.table_index,
-		                               source_column.source_column_index);
+		auto type = source_column.cast_type == LogicalType::INVALID ? source_type : source_column.cast_type;
+		auto name = StringUtil::Format("resultdb_%llu_%llu_%llu", source_column.table_index,
+		                               source_column.source_column_index, working_idx);
 		relation.names.push_back(name);
 		relation.types.push_back(type);
-		projection_expressions.push_back(make_uniq<BoundColumnRefExpression>(
-		    name, type, ColumnBinding(TableIndex(source_column.table_index),
-		                              ProjectionIndex(source_column.source_column_index))));
+		unique_ptr<Expression> expression = make_uniq<BoundColumnRefExpression>(
+		    name, source_type, ColumnBinding(TableIndex(source_column.table_index),
+		                                     ProjectionIndex(source_column.source_column_index)));
+		if (source_column.cast_type != LogicalType::INVALID) {
+			expression = BoundCastExpression::AddDefaultCastToType(std::move(expression), source_column.cast_type);
+		}
+		projection_expressions.push_back(std::move(expression));
 	}
 
 	auto base_plan = BuildResultDBFoldJoinPlan(analysis, node);
@@ -888,12 +959,18 @@ BuildResultDBYannakakisProgram(Binder &binder, ResultDBSemijoinAnalysis &analysi
 	vector<vector<ResultDBYannakakisSourceColumn>> needed_columns(graph.nodes.size());
 	for (auto &edge : graph.edges) {
 		for (auto &condition : edge.conditions) {
-			auto &left_colref = condition.GetLHS().Cast<BoundColumnRefExpression>();
-			auto &right_colref = condition.GetRHS().Cast<BoundColumnRefExpression>();
-			AddResultDBWorkingColumn(needed_columns, edge.left_node, left_colref.binding.table_index.index,
-			                         left_colref.binding.column_index.GetIndex());
-			AddResultDBWorkingColumn(needed_columns, edge.right_node, right_colref.binding.table_index.index,
-			                         right_colref.binding.column_index.GetIndex());
+			ResultDBJoinColumnRef left;
+			ResultDBJoinColumnRef right;
+			if (!TryGetResultDBJoinColumnRef(condition.GetLHS(), left) ||
+			    !TryGetResultDBJoinColumnRef(condition.GetRHS(), right)) {
+				throw InternalException("ResultDB Yannakakis edge contains an invalid join column");
+			}
+			AddResultDBWorkingColumn(needed_columns, edge.left_node, left.column->binding.table_index.index,
+			                         left.column->binding.column_index.GetIndex(),
+			                         GetResultDBJoinColumnCastType(left));
+			AddResultDBWorkingColumn(needed_columns, edge.right_node, right.column->binding.table_index.index,
+			                         right.column->binding.column_index.GetIndex(),
+			                         GetResultDBJoinColumnCastType(right));
 		}
 	}
 
@@ -939,17 +1016,23 @@ BuildResultDBYannakakisProgram(Binder &binder, ResultDBSemijoinAnalysis &analysi
 		program_edge.left_relation = edge.left_node;
 		program_edge.right_relation = edge.right_node;
 		for (auto &condition : edge.conditions) {
-			auto &left_colref = condition.GetLHS().Cast<BoundColumnRefExpression>();
-			auto &right_colref = condition.GetRHS().Cast<BoundColumnRefExpression>();
+			ResultDBJoinColumnRef left;
+			ResultDBJoinColumnRef right;
+			if (!TryGetResultDBJoinColumnRef(condition.GetLHS(), left) ||
+			    !TryGetResultDBJoinColumnRef(condition.GetRHS(), right)) {
+				throw InternalException("ResultDB Yannakakis edge contains an invalid join column");
+			}
 			ResultDBYannakakisJoinColumn column;
 			column.left_column_index =
 			    GetResultDBWorkingColumnIndex(program->relations[program_edge.left_relation].source_columns,
-			                                  left_colref.binding.table_index.index,
-			                                  left_colref.binding.column_index.GetIndex());
+			                                  left.column->binding.table_index.index,
+			                                  left.column->binding.column_index.GetIndex(),
+			                                  GetResultDBJoinColumnCastType(left));
 			column.right_column_index =
 			    GetResultDBWorkingColumnIndex(program->relations[program_edge.right_relation].source_columns,
-			                                  right_colref.binding.table_index.index,
-			                                  right_colref.binding.column_index.GetIndex());
+			                                  right.column->binding.table_index.index,
+			                                  right.column->binding.column_index.GetIndex(),
+			                                  GetResultDBJoinColumnCastType(right));
 			program_edge.columns.push_back(column);
 		}
 		program->edges.push_back(std::move(program_edge));

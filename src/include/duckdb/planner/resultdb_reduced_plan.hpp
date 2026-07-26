@@ -19,6 +19,8 @@ class PhysicalPlan;
 struct ResultDBYannakakisSourceColumn {
 	idx_t table_index = DConstants::INVALID_INDEX;
 	idx_t source_column_index = DConstants::INVALID_INDEX;
+	//! Optional comparison type for a casted join key. INVALID means materialize the source type unchanged.
+	LogicalType cast_type = LogicalType::INVALID;
 };
 
 struct ResultDBYannakakisRelation {
