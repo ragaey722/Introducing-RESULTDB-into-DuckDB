@@ -517,6 +517,8 @@ void PreparedResultDBYannakakisProgram::BuildReductionSchedule() {
 	bottom_up_steps.clear();
 	top_down_steps.clear();
 	required_for_output.assign(relations.size(), 0);
+	relation_phases.clear();
+	relation_phases.resize(relations.size());
 
 	if (relations.empty()) {
 		throw InternalException("ResultDB Yannakakis program has no relations");
@@ -533,7 +535,8 @@ void PreparedResultDBYannakakisProgram::BuildReductionSchedule() {
 		}
 	}
 	vector<uint8_t> seen_output_metadata(outputs.size(), 0);
-	for (auto &output : outputs) {
+	for (idx_t output_idx = 0; output_idx < outputs.size(); output_idx++) {
+		auto &output = outputs[output_idx];
 		if (output.relation >= relations.size()) {
 			throw InternalException("ResultDB Yannakakis output relation is out of range");
 		}
@@ -547,6 +550,7 @@ void PreparedResultDBYannakakisProgram::BuildReductionSchedule() {
 				throw InternalException("ResultDB Yannakakis output column is invalid");
 			}
 		}
+		relation_phases[output.relation].output_indexes.push_back(output_idx);
 	}
 	for (auto &edge : edges) {
 		if (edge.left_relation >= relations.size() || edge.right_relation >= relations.size() ||
@@ -638,6 +642,68 @@ void PreparedResultDBYannakakisProgram::BuildReductionSchedule() {
 		}
 		top_down_steps.push_back(
 		    BuildPreparedResultDBReductionStep(*this, child, parent[child], parent_edge[child]));
+	}
+
+	for (idx_t step_idx = 0; step_idx < bottom_up_steps.size(); step_idx++) {
+		auto &step = bottom_up_steps[step_idx];
+		if (step.source_relation == root_relation || parent[step.source_relation] != step.target_relation) {
+			throw InternalException("ResultDB Yannakakis bottom-up phase does not match the rooted tree");
+		}
+		auto &source_phase = relation_phases[step.source_relation];
+		if (source_phase.bottom_up_to_parent_step != DConstants::INVALID_INDEX) {
+			throw InternalException("ResultDB Yannakakis relation has multiple bottom-up parent phases");
+		}
+		source_phase.bottom_up_to_parent_step = step_idx;
+		relation_phases[step.target_relation].bottom_up_from_children_steps.push_back(step_idx);
+	}
+
+	for (idx_t step_idx = 0; step_idx < top_down_steps.size(); step_idx++) {
+		auto &step = top_down_steps[step_idx];
+		if (step.target_relation == root_relation || !required_for_output[step.target_relation] ||
+		    parent[step.target_relation] != step.source_relation) {
+			throw InternalException("ResultDB Yannakakis top-down phase does not match an output path");
+		}
+		auto &target_phase = relation_phases[step.target_relation];
+		if (target_phase.top_down_from_parent_step != DConstants::INVALID_INDEX) {
+			throw InternalException("ResultDB Yannakakis relation has multiple top-down parent phases");
+		}
+		target_phase.top_down_from_parent_step = step_idx;
+		relation_phases[step.source_relation].top_down_to_children_steps.push_back(step_idx);
+	}
+
+	for (idx_t relation_idx = 0; relation_idx < relations.size(); relation_idx++) {
+		auto &phase = relation_phases[relation_idx];
+		if (relation_idx == root_relation) {
+			if (phase.bottom_up_to_parent_step != DConstants::INVALID_INDEX ||
+			    phase.top_down_from_parent_step != DConstants::INVALID_INDEX) {
+				throw InternalException("ResultDB Yannakakis root unexpectedly has a parent phase");
+			}
+		} else {
+			if (phase.bottom_up_to_parent_step == DConstants::INVALID_INDEX) {
+				throw InternalException("ResultDB Yannakakis non-root relation has no bottom-up parent phase");
+			}
+			if (required_for_output[relation_idx]) {
+				if (phase.top_down_from_parent_step == DConstants::INVALID_INDEX) {
+					throw InternalException("ResultDB Yannakakis output-path relation has no top-down parent phase");
+				}
+				phase.retain_bottom_up = true;
+			} else if (phase.top_down_from_parent_step != DConstants::INVALID_INDEX) {
+				throw InternalException("ResultDB Yannakakis off-output relation has a top-down parent phase");
+			}
+		}
+
+		for (auto step_idx : phase.top_down_to_children_steps) {
+			auto &top_down_step = top_down_steps[step_idx];
+			auto &child_phase = relation_phases[top_down_step.target_relation];
+			if (child_phase.bottom_up_to_parent_step == DConstants::INVALID_INDEX) {
+				throw InternalException("ResultDB Yannakakis top-down child has no bottom-up phase");
+			}
+			auto &bottom_up_step = bottom_up_steps[child_phase.bottom_up_to_parent_step];
+			if (bottom_up_step.source_relation != top_down_step.target_relation ||
+			    bottom_up_step.target_relation != relation_idx) {
+				throw InternalException("ResultDB Yannakakis top-down phase does not match its bottom-up edge");
+			}
+		}
 	}
 }
 

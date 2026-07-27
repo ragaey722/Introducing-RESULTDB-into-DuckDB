@@ -3,6 +3,7 @@
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/aggregate_hashtable.hpp"
+#include "duckdb/execution/operator/helper/physical_resultdb_yannakakis_phase.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -22,28 +23,6 @@ static PreparedResultDBYannakakisProgram &GetPreparedResultDBYannakakisProgram(P
 	}
 	return *data.resultdb_yannakakis_program;
 }
-
-PhysicalResultDBDirectCollector::PhysicalResultDBDirectCollector(PhysicalPlan &physical_plan,
-                                                                 PreparedStatementData &data)
-    : PhysicalResultCollector(physical_plan, data), program(GetPreparedResultDBYannakakisProgram(data)) {
-	for (auto &base_plan : program.base_plans) {
-		base_plans.push_back(base_plan->Root());
-	}
-}
-
-class ResultDBDirectCollectorGlobalState : public GlobalSinkState {
-public:
-	mutex combine_lock;
-	vector<unique_ptr<ColumnDataCollection>> relation_collections;
-	shared_ptr<ClientContext> context;
-};
-
-class ResultDBDirectCollectorLocalState : public LocalSinkState {
-public:
-	idx_t relation_idx = DConstants::INVALID_INDEX;
-	unique_ptr<ColumnDataCollection> collection;
-	ColumnDataAppendState append_state;
-};
 
 static vector<LogicalType> GetResultDBTableTypes(const ResultDBTableMetadata &table) {
 	vector<LogicalType> types;
@@ -225,18 +204,21 @@ ApplyResultDBDirectSemijoin(ClientContext &context, QueryResultMemoryType memory
 	return output;
 }
 
-static bool ExecuteResultDBDirectReduction(ClientContext &context, QueryResultMemoryType memory_type,
-                                           const PhysicalOperator &op,
-                                           const PreparedResultDBYannakakisProgram &program,
-                                           vector<unique_ptr<ColumnDataCollection>> &relations) {
+static bool ExecuteResultDBDirectTopDown(ClientContext &context, QueryResultMemoryType memory_type,
+                                         const PhysicalOperator &op,
+                                         const PreparedResultDBYannakakisProgram &program,
+                                         vector<unique_ptr<ColumnDataCollection>> &relations) {
 	if (program.root_relation >= relations.size()) {
 		throw InternalException("ResultDB Yannakakis program has an invalid root relation");
+	}
+	if (!relations[program.root_relation]) {
+		throw InternalException("ResultDB Yannakakis bottom-up root relation is unavailable");
 	}
 
 	auto reduce = [&](const PreparedResultDBYannakakisReductionStep &step) {
 		if (step.target_relation >= relations.size() || step.source_relation >= relations.size() ||
 		    !relations[step.target_relation] || !relations[step.source_relation]) {
-			throw InternalException("ResultDB Yannakakis reduction references an unavailable relation");
+			throw InternalException("ResultDB Yannakakis top-down reduction references an unavailable relation");
 		}
 		auto &target = relations[step.target_relation];
 		auto &source = relations[step.source_relation];
@@ -250,13 +232,6 @@ static bool ExecuteResultDBDirectReduction(ClientContext &context, QueryResultMe
 		target = ApplyResultDBDirectSemijoin(context, memory_type, op, *target, *source, step.target_columns,
 		                                    step.source_columns);
 	};
-
-	for (auto &step : program.bottom_up_steps) {
-		reduce(step);
-		if (!program.required_for_output[step.source_relation]) {
-			relations[step.source_relation].reset();
-		}
-	}
 
 	if (relations[program.root_relation]->Count() == 0) {
 		return true;
@@ -323,73 +298,129 @@ BuildResultDBDirectOutputCollection(ClientContext &context, QueryResultMemoryTyp
 	return collection;
 }
 
-unique_ptr<GlobalSinkState> PhysicalResultDBDirectCollector::GetGlobalSinkState(ClientContext &context) const {
-	if (program.relations.empty() || program.base_plans.size() != program.relations.size()) {
-		throw InternalException("ResultDB direct collector expected prepared base relation plans");
+PhysicalResultDBDirectCollector::PhysicalResultDBDirectCollector(PhysicalPlan &physical_plan,
+                                                                 PreparedStatementData &data)
+    : PhysicalResultCollector(physical_plan, data), program(GetPreparedResultDBYannakakisProgram(data)) {
+	if (program.relations.empty() || program.base_plans.size() != program.relations.size() ||
+	    program.relation_phases.size() != program.relations.size() ||
+	    program.root_relation >= program.relations.size()) {
+		throw InternalException("ResultDB direct collector expected a prepared phase program");
+	}
+	for (auto &base_plan : program.base_plans) {
+		base_plans.push_back(base_plan->Root());
 	}
 
-	auto state = make_uniq<ResultDBDirectCollectorGlobalState>();
-	state->context = context.shared_from_this();
-	for (auto &relation : program.relations) {
-		state->relation_collections.push_back(CreateResultDBDirectCollection(context, memory_type, relation.types));
+	bottom_up_phases.resize(program.relations.size());
+	root_bottom_up_phase = make_uniq<PhysicalResultDBYannakakisPhase>(
+	    physical_plan, base_plans[program.root_relation], program.root_relation,
+	    program.relations[program.root_relation].types, memory_type, true, "RESULTDB_BOTTOM_UP_ROOT");
+	// A multi-relation program without edges is the existing statically-empty
+	// special case. Its root stream is sufficient to initialize the collector;
+	// GetResult constructs every typed empty output directly.
+	if (program.edges.empty()) {
+		return;
 	}
-	return std::move(state);
+	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
+		if (relation_idx == program.root_relation) {
+			continue;
+		}
+		bottom_up_phases[relation_idx] = make_uniq<PhysicalResultDBYannakakisPhase>(
+		    physical_plan, base_plans[relation_idx], relation_idx, program.relations[relation_idx].types, memory_type,
+		    program.relation_phases[relation_idx].retain_bottom_up, "RESULTDB_BOTTOM_UP");
+	}
+
+	// Every non-root relation builds exactly one child-to-parent key set.
+	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
+		if (relation_idx == program.root_relation) {
+			continue;
+		}
+		auto step_idx = program.relation_phases[relation_idx].bottom_up_to_parent_step;
+		if (step_idx >= program.bottom_up_steps.size()) {
+			throw InternalException("ResultDB bottom-up phase is missing its parent reduction step");
+		}
+		auto &step = program.bottom_up_steps[step_idx];
+		if (step.source_relation != relation_idx) {
+			throw InternalException("ResultDB bottom-up phase has an invalid parent reduction step");
+		}
+		auto output_idx = bottom_up_phases[relation_idx]->AddOutputKey(
+		    step.source_columns, program.relations[step.target_relation].types, step.target_columns);
+		D_ASSERT(output_idx == 0);
+	}
+
+	// A parent probes every finalized child key set in the canonical prepared
+	// bottom-up order. The root delegates its sink interface to root_bottom_up_phase.
+	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
+		auto &consumer = relation_idx == program.root_relation ? *root_bottom_up_phase
+		                                                       : *bottom_up_phases[relation_idx];
+		for (auto step_idx : program.relation_phases[relation_idx].bottom_up_from_children_steps) {
+			if (step_idx >= program.bottom_up_steps.size()) {
+				throw InternalException("ResultDB bottom-up phase references an invalid child step");
+			}
+			auto child_relation = program.bottom_up_steps[step_idx].source_relation;
+			if (child_relation == program.root_relation || !bottom_up_phases[child_relation]) {
+				throw InternalException("ResultDB bottom-up phase references an invalid child producer");
+			}
+			consumer.AddInputKey(*bottom_up_phases[child_relation], 0);
+		}
+	}
+}
+
+PhysicalResultDBDirectCollector::~PhysicalResultDBDirectCollector() {
+}
+
+unique_ptr<GlobalSinkState> PhysicalResultDBDirectCollector::GetGlobalSinkState(ClientContext &context) const {
+	return root_bottom_up_phase->GetGlobalSinkState(context);
 }
 
 unique_ptr<LocalSinkState> PhysicalResultDBDirectCollector::GetLocalSinkState(ExecutionContext &context) const {
-	if (!context.pipeline) {
-		throw InternalException("ResultDB direct collector local sink state requires a pipeline");
-	}
-	auto entry = pipeline_relation_map.find(context.pipeline.get());
-	if (entry == pipeline_relation_map.end()) {
-		throw InternalException("ResultDB direct collector could not map pipeline to Yannakakis relation");
-	}
-
-	auto state = make_uniq<ResultDBDirectCollectorLocalState>();
-	state->relation_idx = entry->second;
-	state->collection =
-	    make_uniq<ColumnDataCollection>(context.client, base_plans[state->relation_idx].get().GetTypes());
-	state->collection->InitializeAppend(state->append_state);
-	return std::move(state);
+	return root_bottom_up_phase->GetLocalSinkState(context);
 }
 
 SinkResultType PhysicalResultDBDirectCollector::Sink(ExecutionContext &context, DataChunk &chunk,
                                                      OperatorSinkInput &input) const {
-	auto &lstate = input.local_state.Cast<ResultDBDirectCollectorLocalState>();
-	lstate.collection->Append(lstate.append_state, chunk);
-	return SinkResultType::NEED_MORE_INPUT;
+	return root_bottom_up_phase->Sink(context, chunk, input);
 }
 
 SinkCombineResultType PhysicalResultDBDirectCollector::Combine(ExecutionContext &context,
                                                                OperatorSinkCombineInput &input) const {
-	auto &gstate = input.global_state.Cast<ResultDBDirectCollectorGlobalState>();
-	auto &lstate = input.local_state.Cast<ResultDBDirectCollectorLocalState>();
-	if (lstate.collection->Count() == 0) {
-		return SinkCombineResultType::FINISHED;
-	}
+	return root_bottom_up_phase->Combine(context, input);
+}
 
-	lock_guard<mutex> guard(gstate.combine_lock);
-	gstate.relation_collections[lstate.relation_idx]->Combine(*lstate.collection);
-	return SinkCombineResultType::FINISHED;
+SinkFinalizeType PhysicalResultDBDirectCollector::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+                                                           OperatorSinkFinalizeInput &input) const {
+	return root_bottom_up_phase->Finalize(pipeline, event, context, input);
 }
 
 unique_ptr<QueryResult> PhysicalResultDBDirectCollector::GetResult(GlobalSinkState &state) const {
-	auto &gstate = state.Cast<ResultDBDirectCollectorGlobalState>();
 	if (properties.resultdb.tables.empty()) {
 		throw InternalException("RESULTDB query has no output tables");
 	}
 
+	auto context = root_bottom_up_phase->GetClientContext(state);
+	vector<unique_ptr<ColumnDataCollection>> relation_collections(program.relations.size());
+	relation_collections[program.root_relation] = root_bottom_up_phase->TakeRetainedRows(state);
+	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
+		if (relation_idx == program.root_relation || !program.relation_phases[relation_idx].retain_bottom_up) {
+			continue;
+		}
+		auto &phase = *bottom_up_phases[relation_idx];
+		if (!phase.sink_state) {
+			throw InternalException("ResultDB bottom-up phase did not initialize its retained relation");
+		}
+		relation_collections[relation_idx] = phase.TakeRetainedRows(*phase.sink_state);
+	}
+
 	auto globally_empty =
-	    ExecuteResultDBDirectReduction(*gstate.context, memory_type, *this, program, gstate.relation_collections);
+	    ExecuteResultDBDirectTopDown(*context, memory_type, *this, program, relation_collections);
 
 	vector<idx_t> remaining_output_uses(program.relations.size(), 0);
 	for (auto &output : program.outputs) {
 		remaining_output_uses[output.relation]++;
 	}
 	if (!globally_empty) {
-		for (idx_t relation_idx = 0; relation_idx < gstate.relation_collections.size(); relation_idx++) {
+		for (idx_t relation_idx = 0; relation_idx < relation_collections.size(); relation_idx++) {
 			if (remaining_output_uses[relation_idx] == 0) {
-				gstate.relation_collections[relation_idx].reset();
+				relation_collections[relation_idx].reset();
 			}
 		}
 	}
@@ -399,21 +430,21 @@ unique_ptr<QueryResult> PhysicalResultDBDirectCollector::GetResult(GlobalSinkSta
 	for (auto &output : program.outputs) {
 		if (globally_empty) {
 			output_collections[output.table_metadata_index] =
-			    CreateResultDBDirectCollection(*gstate.context, memory_type, GetResultDBDirectOutputTypes(output));
+			    CreateResultDBDirectCollection(*context, memory_type, GetResultDBDirectOutputTypes(output));
 		} else {
-			if (!gstate.relation_collections[output.relation]) {
+			if (!relation_collections[output.relation]) {
 				throw InternalException("ResultDB direct output relation was released too early");
 			}
 			output_collections[output.table_metadata_index] =
-			    BuildResultDBDirectOutputCollection(*gstate.context, memory_type, output,
-			                                        *gstate.relation_collections[output.relation]);
+			    BuildResultDBDirectOutputCollection(*context, memory_type, output,
+			                                        *relation_collections[output.relation]);
 			if (--remaining_output_uses[output.relation] == 0) {
-				gstate.relation_collections[output.relation].reset();
+				relation_collections[output.relation].reset();
 			}
 		}
 	}
 	if (globally_empty) {
-		for (auto &relation : gstate.relation_collections) {
+		for (auto &relation : relation_collections) {
 			relation.reset();
 		}
 	}
@@ -427,7 +458,7 @@ unique_ptr<QueryResult> PhysicalResultDBDirectCollector::GetResult(GlobalSinkSta
 		}
 		auto table_result = make_uniq<MaterializedQueryResult>(
 		    statement_type, GetResultDBSingleTableProperties(properties, table_idx), GetResultDBTableNames(table),
-		    std::move(output_collections[table_idx]), gstate.context->GetClientProperties());
+		    std::move(output_collections[table_idx]), context->GetClientProperties());
 		auto table_result_ptr = table_result.get();
 		if (!first_result) {
 			first_result = std::move(table_result);
@@ -441,28 +472,53 @@ unique_ptr<QueryResult> PhysicalResultDBDirectCollector::GetResult(GlobalSinkSta
 
 vector<const_reference<PhysicalOperator>> PhysicalResultDBDirectCollector::GetChildren() const {
 	vector<const_reference<PhysicalOperator>> result;
-	for (auto &base_plan : base_plans) {
-		result.push_back(base_plan.get());
+	result.push_back(base_plans[program.root_relation]);
+	for (idx_t relation_idx = 0; relation_idx < bottom_up_phases.size(); relation_idx++) {
+		if (bottom_up_phases[relation_idx]) {
+			result.push_back(*bottom_up_phases[relation_idx]);
+		}
 	}
 	return result;
 }
 
 void PhysicalResultDBDirectCollector::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
 	sink_state.reset();
-	pipeline_relation_map.clear();
+	root_bottom_up_phase->sink_state.reset();
+	for (auto &phase : bottom_up_phases) {
+		if (phase) {
+			phase->sink_state.reset();
+		}
+	}
 
 	auto &state = meta_pipeline.GetState();
 	state.SetPipelineSource(current, *this);
 
+	vector<shared_ptr<Pipeline>> phase_pipelines(program.relations.size());
 	for (idx_t relation_idx = 0; relation_idx < base_plans.size(); relation_idx++) {
-		auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this);
-		child_meta_pipeline.Build(base_plans[relation_idx].get());
-
-		vector<shared_ptr<Pipeline>> child_pipelines;
-		child_meta_pipeline.GetPipelines(child_pipelines, false);
-		for (auto &pipeline : child_pipelines) {
-			pipeline_relation_map[pipeline.get()] = relation_idx;
+		PhysicalOperator *phase_sink;
+		if (relation_idx == program.root_relation) {
+			phase_sink = this;
+		} else if (bottom_up_phases[relation_idx]) {
+			phase_sink = bottom_up_phases[relation_idx].get();
+		} else {
+			continue;
 		}
+		auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *phase_sink);
+		child_meta_pipeline.Build(base_plans[relation_idx].get());
+		phase_pipelines[relation_idx] = child_meta_pipeline.GetBasePipeline();
+	}
+
+	// A parent phase may start only after every child phase has completed
+	// Combine and synchronous key-table Finalize.
+	for (idx_t child_relation = 0; child_relation < program.relations.size(); child_relation++) {
+		if (child_relation == program.root_relation || !phase_pipelines[child_relation]) {
+			continue;
+		}
+		auto parent_relation = program.parent[child_relation];
+		if (parent_relation >= phase_pipelines.size() || !phase_pipelines[parent_relation]) {
+			throw InternalException("ResultDB bottom-up pipeline has an invalid parent dependency");
+		}
+		phase_pipelines[parent_relation]->AddDependency(phase_pipelines[child_relation]);
 	}
 }
 

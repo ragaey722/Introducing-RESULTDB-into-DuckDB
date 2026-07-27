@@ -15,6 +15,8 @@ add_library_unity(
   physical_prepare.cpp
   physical_resultdb_decompose_collector.cpp
   physical_resultdb_direct_collector.cpp
+  physical_resultdb_yannakakis_phase.cpp
+  resultdb_direct_key_set.cpp
   physical_reservoir_sample.cpp
   physical_result_collector.cpp
   physical_set.cpp

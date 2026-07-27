@@ -35,7 +35,7 @@ struct ResultDBYannakakisRelation {
 	//! Working relation output names/types.
 	vector<string> names;
 	vector<LogicalType> types;
-	//! Logical plan that materializes the filtered, projected, duplicate-free base relation.
+	//! Logical plan that produces the filtered/projected working relation. Folded plans retain DISTINCT.
 	unique_ptr<LogicalOperator> base_plan;
 };
 
@@ -69,6 +69,21 @@ struct PreparedResultDBYannakakisReductionStep {
 	vector<idx_t> source_columns;
 };
 
+struct PreparedResultDBYannakakisRelationPhase {
+	//! Index into bottom_up_steps for this relation -> parent, or INVALID for the root.
+	idx_t bottom_up_to_parent_step = DConstants::INVALID_INDEX;
+	//! Indexes into bottom_up_steps for child -> this relation, in prepared execution order.
+	vector<idx_t> bottom_up_from_children_steps;
+	//! Index into top_down_steps for parent -> this relation, or INVALID when no top-down reduction is needed.
+	idx_t top_down_from_parent_step = DConstants::INVALID_INDEX;
+	//! Indexes into top_down_steps for this relation -> required children, in prepared execution order.
+	vector<idx_t> top_down_to_children_steps;
+	//! Indexes into PreparedResultDBYannakakisProgram::outputs produced by this relation.
+	vector<idx_t> output_indexes;
+	//! Whether bottom-up survivors must remain live until this relation's top-down phase.
+	bool retain_bottom_up = false;
+};
+
 struct ResultDBYannakakisProgram {
 	idx_t root_relation = DConstants::INVALID_INDEX;
 	vector<idx_t> parent;
@@ -95,6 +110,8 @@ struct PreparedResultDBYannakakisProgram {
 	vector<PreparedResultDBYannakakisReductionStep> top_down_steps;
 	//! Whether a relation lies on a root-to-output path and must remain live through top-down reduction.
 	vector<uint8_t> required_for_output;
+	//! Per-relation roles and references into the prepared bottom-up/top-down schedules.
+	vector<PreparedResultDBYannakakisRelationPhase> relation_phases;
 
 	//! Validates the tree program and compiles oriented, output-directed reduction steps.
 	void BuildReductionSchedule();

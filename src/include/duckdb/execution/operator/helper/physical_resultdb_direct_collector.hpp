@@ -8,17 +8,18 @@
 
 #pragma once
 
-#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 
 namespace duckdb {
 
 struct PreparedResultDBYannakakisProgram;
+class PhysicalResultDBYannakakisPhase;
 
 //! PhysicalResultDBDirectCollector executes a shared Yannakakis program and returns each reduced relation separately.
 class PhysicalResultDBDirectCollector : public PhysicalResultCollector {
 public:
 	PhysicalResultDBDirectCollector(PhysicalPlan &physical_plan, PreparedStatementData &data);
+	~PhysicalResultDBDirectCollector() override;
 
 public:
 	unique_ptr<QueryResult> GetResult(GlobalSinkState &state) const override;
@@ -27,6 +28,8 @@ public:
 	// Sink interface
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override;
 
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
@@ -40,8 +43,8 @@ public:
 private:
 	const PreparedResultDBYannakakisProgram &program;
 	vector<reference<PhysicalOperator>> base_plans;
-	// Raw pipeline pointers are valid for the executor lifetime; the meta-pipeline graph owns the pipelines.
-	mutable unordered_map<const Pipeline *, idx_t> pipeline_relation_map;
+	unique_ptr<PhysicalResultDBYannakakisPhase> root_bottom_up_phase;
+	vector<unique_ptr<PhysicalResultDBYannakakisPhase>> bottom_up_phases;
 };
 
 } // namespace duckdb

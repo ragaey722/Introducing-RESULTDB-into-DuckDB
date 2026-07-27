@@ -474,6 +474,7 @@ TEST_CASE("Test ResultDB strategy setting", "[api]") {
 		REQUIRE(CHECK_COLUMN(setting_result, 0, {strategy_case.stored_value}));
 
 		duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + from_clause);
+		INFO(result->GetError());
 		REQUIRE(!result->HasError());
 		RequireResultDBStrategy(*result, strategy_case.requested_strategy, strategy_case.execution_strategy);
 		if (strategy_case.execution_strategy == ResultDBStrategy::SEMIJOIN) {
@@ -1174,6 +1175,97 @@ TEST_CASE("Test ResultDB prepared schedule prunes unrequested top-down branches"
 	REQUIRE(program.top_down_steps[0].target_relation == 2);
 	REQUIRE(program.top_down_steps[0].source_relation == 0);
 	REQUIRE(program.required_for_output == vector<uint8_t> {1, 0, 1, 0});
+
+	REQUIRE(program.relation_phases.size() == 4);
+	REQUIRE(program.relation_phases[0].bottom_up_from_children_steps == vector<idx_t> {0, 1, 2});
+	REQUIRE(program.relation_phases[0].top_down_to_children_steps == vector<idx_t> {0});
+	REQUIRE(!program.relation_phases[0].retain_bottom_up);
+	REQUIRE(program.relation_phases[1].bottom_up_to_parent_step == 2);
+	REQUIRE(program.relation_phases[1].top_down_from_parent_step == DConstants::INVALID_INDEX);
+	REQUIRE(!program.relation_phases[1].retain_bottom_up);
+	REQUIRE(program.relation_phases[2].bottom_up_to_parent_step == 1);
+	REQUIRE(program.relation_phases[2].top_down_from_parent_step == 0);
+	REQUIRE(program.relation_phases[2].output_indexes == vector<idx_t> {0});
+	REQUIRE(program.relation_phases[2].retain_bottom_up);
+	REQUIRE(program.relation_phases[3].bottom_up_to_parent_step == 0);
+	REQUIRE(program.relation_phases[3].top_down_from_parent_step == DConstants::INVALID_INDEX);
+	REQUIRE(!program.relation_phases[3].retain_bottom_up);
+}
+
+TEST_CASE("Test ResultDB prepared phases classify root, relay, off-path, and output relations", "[api]") {
+	PreparedResultDBYannakakisProgram program;
+	program.root_relation = 0; // D
+	program.parent = {DConstants::INVALID_INDEX, 0, 1, 1};
+	program.parent_edge = {DConstants::INVALID_INDEX, 0, 1, 2};
+	program.order = {0, 1, 2, 3};
+	program.relations.resize(4);
+	for (auto &relation : program.relations) {
+		relation.names = {"value"};
+		relation.types = {LogicalType::INTEGER};
+	}
+	// D-B, B-A, B-C
+	const vector<std::pair<idx_t, idx_t>> tree_edges {{0, 1}, {1, 2}, {1, 3}};
+	for (auto &endpoints : tree_edges) {
+		ResultDBYannakakisEdge edge;
+		edge.left_relation = endpoints.first;
+		edge.right_relation = endpoints.second;
+		edge.columns.push_back({0, 0});
+		program.edges.push_back(std::move(edge));
+	}
+	ResultDBYannakakisOutputTable output;
+	output.relation = 3; // Only C is requested.
+	output.table_metadata_index = 0;
+	output.columns.push_back({0, "value", LogicalType::INTEGER});
+	program.outputs.push_back(std::move(output));
+
+	program.BuildReductionSchedule();
+
+	REQUIRE(program.bottom_up_steps.size() == 3);
+	REQUIRE(program.bottom_up_steps[0].target_relation == 1);
+	REQUIRE(program.bottom_up_steps[0].source_relation == 3);
+	REQUIRE(program.bottom_up_steps[1].target_relation == 1);
+	REQUIRE(program.bottom_up_steps[1].source_relation == 2);
+	REQUIRE(program.bottom_up_steps[2].target_relation == 0);
+	REQUIRE(program.bottom_up_steps[2].source_relation == 1);
+	REQUIRE(program.top_down_steps.size() == 2);
+	REQUIRE(program.top_down_steps[0].target_relation == 1);
+	REQUIRE(program.top_down_steps[0].source_relation == 0);
+	REQUIRE(program.top_down_steps[1].target_relation == 3);
+	REQUIRE(program.top_down_steps[1].source_relation == 1);
+	REQUIRE(program.required_for_output == vector<uint8_t> {1, 1, 0, 1});
+
+	REQUIRE(program.relation_phases.size() == 4);
+	auto &root = program.relation_phases[0];
+	REQUIRE(root.bottom_up_to_parent_step == DConstants::INVALID_INDEX);
+	REQUIRE(root.bottom_up_from_children_steps == vector<idx_t> {2});
+	REQUIRE(root.top_down_from_parent_step == DConstants::INVALID_INDEX);
+	REQUIRE(root.top_down_to_children_steps == vector<idx_t> {0});
+	REQUIRE(root.output_indexes.empty());
+	REQUIRE(!root.retain_bottom_up);
+
+	auto &relay = program.relation_phases[1];
+	REQUIRE(relay.bottom_up_to_parent_step == 2);
+	REQUIRE(relay.bottom_up_from_children_steps == vector<idx_t> {0, 1});
+	REQUIRE(relay.top_down_from_parent_step == 0);
+	REQUIRE(relay.top_down_to_children_steps == vector<idx_t> {1});
+	REQUIRE(relay.output_indexes.empty());
+	REQUIRE(relay.retain_bottom_up);
+
+	auto &off_path_leaf = program.relation_phases[2];
+	REQUIRE(off_path_leaf.bottom_up_to_parent_step == 1);
+	REQUIRE(off_path_leaf.bottom_up_from_children_steps.empty());
+	REQUIRE(off_path_leaf.top_down_from_parent_step == DConstants::INVALID_INDEX);
+	REQUIRE(off_path_leaf.top_down_to_children_steps.empty());
+	REQUIRE(off_path_leaf.output_indexes.empty());
+	REQUIRE(!off_path_leaf.retain_bottom_up);
+
+	auto &output_leaf = program.relation_phases[3];
+	REQUIRE(output_leaf.bottom_up_to_parent_step == 0);
+	REQUIRE(output_leaf.bottom_up_from_children_steps.empty());
+	REQUIRE(output_leaf.top_down_from_parent_step == 1);
+	REQUIRE(output_leaf.top_down_to_children_steps.empty());
+	REQUIRE(output_leaf.output_indexes == vector<idx_t> {0});
+	REQUIRE(output_leaf.retain_bottom_up);
 }
 
 TEST_CASE("Test streaming API errors", "[api]") {
