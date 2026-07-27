@@ -4,15 +4,12 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/aggregate_hashtable.hpp"
 #include "duckdb/execution/operator/helper/physical_resultdb_yannakakis_phase.hpp"
-#include "duckdb/execution/operator/join/physical_hash_join.hpp"
-#include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 
 namespace duckdb {
@@ -22,14 +19,6 @@ static PreparedResultDBYannakakisProgram &GetPreparedResultDBYannakakisProgram(P
 		throw InternalException("ResultDB direct collector expected a prepared Yannakakis program");
 	}
 	return *data.resultdb_yannakakis_program;
-}
-
-static vector<LogicalType> GetResultDBTableTypes(const ResultDBTableMetadata &table) {
-	vector<LogicalType> types;
-	for (auto &column : table.columns) {
-		types.push_back(column.type);
-	}
-	return types;
 }
 
 static vector<string> GetResultDBTableNames(const ResultDBTableMetadata &table) {
@@ -64,185 +53,6 @@ static StatementProperties GetResultDBSingleTableProperties(StatementProperties 
 	return properties;
 }
 
-static vector<LogicalType> GetResultDBDirectColumnTypes(const vector<LogicalType> &input_types,
-                                                        const vector<idx_t> &columns) {
-	vector<LogicalType> result;
-	result.reserve(columns.size());
-	for (auto column_idx : columns) {
-		result.push_back(input_types[column_idx]);
-	}
-	return result;
-}
-
-static vector<column_t> ToResultDBDirectColumnIds(const vector<idx_t> &columns) {
-	vector<column_t> result;
-	result.reserve(columns.size());
-	for (auto column_idx : columns) {
-		result.push_back(column_t(column_idx));
-	}
-	return result;
-}
-
-static vector<JoinCondition> BuildResultDBDirectJoinConditions(const vector<LogicalType> &key_types) {
-	vector<JoinCondition> conditions;
-	conditions.reserve(key_types.size());
-	for (idx_t key_idx = 0; key_idx < key_types.size(); key_idx++) {
-		auto lhs = make_uniq<BoundReferenceExpression>(key_types[key_idx], key_idx);
-		auto rhs = make_uniq<BoundReferenceExpression>(key_types[key_idx], key_idx);
-		conditions.emplace_back(std::move(lhs), std::move(rhs), ExpressionType::COMPARE_EQUAL);
-	}
-	return conditions;
-}
-
-static vector<idx_t> BuildResultDBDirectIdentityProjection(idx_t column_count) {
-	vector<idx_t> result;
-	result.reserve(column_count);
-	for (idx_t column_idx = 0; column_idx < column_count; column_idx++) {
-		result.push_back(column_idx);
-	}
-	return result;
-}
-
-struct ResultDBDirectHashTableState {
-	//! JoinHashTable keeps references to these vectors; keep them alive with the table.
-	vector<JoinCondition> conditions;
-	vector<idx_t> output_columns;
-	vector<idx_t> output_in_probe;
-	unique_ptr<JoinHashTable> table;
-};
-
-static unique_ptr<ResultDBDirectHashTableState>
-BuildResultDBDirectHashTable(ClientContext &context, const PhysicalOperator &op, const ColumnDataCollection &source,
-                             const vector<idx_t> &source_columns, idx_t target_column_count) {
-	auto key_types = GetResultDBDirectColumnTypes(source.Types(), source_columns);
-	vector<LogicalType> payload_types;
-
-	auto state = make_uniq<ResultDBDirectHashTableState>();
-	state->conditions = BuildResultDBDirectJoinConditions(key_types);
-	state->output_in_probe = BuildResultDBDirectIdentityProjection(target_column_count);
-	state->table = make_uniq<JoinHashTable>(context, op, state->conditions, payload_types, JoinType::SEMI, 0U,
-	                                        state->output_columns, nullptr, nullptr, state->output_in_probe);
-
-	auto source_column_ids = ToResultDBDirectColumnIds(source_columns);
-	PartitionedTupleDataAppendState append_state;
-	ColumnDataScanState source_scan;
-	DataChunk source_chunk;
-	DataChunk source_keys;
-	DataChunk empty_payload;
-	source.InitializeScan(source_scan, source_column_ids);
-	source.InitializeScanChunk(source_scan, source_chunk);
-	source_keys.Initialize(Allocator::Get(context), key_types);
-	state->table->GetSinkCollection().InitializeAppendState(append_state);
-	while (source.Scan(source_scan, source_chunk)) {
-		source_keys.Reset();
-		for (idx_t key_idx = 0; key_idx < source_columns.size(); key_idx++) {
-			source_keys.data[key_idx].Reference(source_chunk.data[key_idx]);
-		}
-		source_keys.SetCardinality(source_chunk);
-		empty_payload.SetCardinality(source_chunk);
-		state->table->Build(append_state, source_keys, empty_payload);
-	}
-
-	state->table->Unpartition();
-	state->table->AllocatePointerTable();
-	state->table->InitializePointerTable(0U, state->table->capacity);
-	if (state->table->Count() > 0) {
-		state->table->Finalize(0U, state->table->GetDataCollection().ChunkCount(), false);
-	}
-	state->table->finalized = true;
-	return state;
-}
-
-static unique_ptr<ColumnDataCollection>
-ApplyResultDBDirectSemijoin(ClientContext &context, QueryResultMemoryType memory_type, const PhysicalOperator &op,
-                            const ColumnDataCollection &target, const ColumnDataCollection &source,
-                            const vector<idx_t> &target_columns, const vector<idx_t> &source_columns) {
-	auto key_types = GetResultDBDirectColumnTypes(target.Types(), target_columns);
-	auto hash_table_state = BuildResultDBDirectHashTable(context, op, source, source_columns, target.Types().size());
-	auto &hash_table = *hash_table_state->table;
-	auto output = CreateResultDBDirectCollection(context, memory_type, target.Types());
-	ColumnDataAppendState append_state;
-	output->InitializeAppend(append_state);
-
-	if (hash_table.Count() == 0) {
-		return output;
-	}
-
-	ColumnDataScanState target_scan;
-	DataChunk target_chunk;
-	DataChunk target_keys;
-	DataChunk probe_data;
-	DataChunk result_chunk;
-	target.InitializeScan(target_scan);
-	target.InitializeScanChunk(target_scan, target_chunk);
-	target_keys.Initialize(Allocator::Get(context), key_types);
-	probe_data.Initialize(Allocator::Get(context), target.Types());
-	result_chunk.Initialize(Allocator::Get(context), target.Types());
-
-	TupleDataChunkState key_state;
-	TupleDataCollection::InitializeChunkState(key_state, key_types);
-	JoinHashTable::ScanStructure scan_structure(hash_table, key_state);
-	JoinHashTable::ProbeState probe_state;
-
-	while (target.Scan(target_scan, target_chunk)) {
-		target_keys.Reset();
-		for (idx_t key_idx = 0; key_idx < target_columns.size(); key_idx++) {
-			target_keys.data[key_idx].Reference(target_chunk.data[target_columns[key_idx]]);
-		}
-		target_keys.SetCardinality(target_chunk);
-		probe_data.Reference(target_chunk);
-
-		hash_table.Probe(scan_structure, target_keys, key_state, probe_state);
-		do {
-			result_chunk.Reset();
-			scan_structure.Next(target_keys, probe_data, result_chunk);
-			if (result_chunk.size() > 0) {
-				output->Append(append_state, result_chunk);
-			}
-		} while (!scan_structure.PointersExhausted() && result_chunk.size() > 0);
-	}
-	return output;
-}
-
-static bool ExecuteResultDBDirectTopDown(ClientContext &context, QueryResultMemoryType memory_type,
-                                         const PhysicalOperator &op,
-                                         const PreparedResultDBYannakakisProgram &program,
-                                         vector<unique_ptr<ColumnDataCollection>> &relations) {
-	if (program.root_relation >= relations.size()) {
-		throw InternalException("ResultDB Yannakakis program has an invalid root relation");
-	}
-	if (!relations[program.root_relation]) {
-		throw InternalException("ResultDB Yannakakis bottom-up root relation is unavailable");
-	}
-
-	auto reduce = [&](const PreparedResultDBYannakakisReductionStep &step) {
-		if (step.target_relation >= relations.size() || step.source_relation >= relations.size() ||
-		    !relations[step.target_relation] || !relations[step.source_relation]) {
-			throw InternalException("ResultDB Yannakakis top-down reduction references an unavailable relation");
-		}
-		auto &target = relations[step.target_relation];
-		auto &source = relations[step.source_relation];
-		if (target->Count() == 0) {
-			return;
-		}
-		if (source->Count() == 0) {
-			target = CreateResultDBDirectCollection(context, memory_type, target->Types());
-			return;
-		}
-		target = ApplyResultDBDirectSemijoin(context, memory_type, op, *target, *source, step.target_columns,
-		                                    step.source_columns);
-	};
-
-	if (relations[program.root_relation]->Count() == 0) {
-		return true;
-	}
-
-	for (auto &step : program.top_down_steps) {
-		reduce(step);
-	}
-	return false;
-}
-
 static vector<LogicalType> GetResultDBDirectOutputTypes(const ResultDBYannakakisOutputTable &output) {
 	vector<LogicalType> types;
 	types.reserve(output.columns.size());
@@ -253,29 +63,8 @@ static vector<LogicalType> GetResultDBDirectOutputTypes(const ResultDBYannakakis
 }
 
 static unique_ptr<ColumnDataCollection>
-BuildResultDBDirectOutputCollection(ClientContext &context, QueryResultMemoryType memory_type,
-                                    const ResultDBYannakakisOutputTable &output,
-                                    const ColumnDataCollection &relation) {
-	auto types = GetResultDBDirectOutputTypes(output);
-	vector<column_t> projection_column_ids;
-	projection_column_ids.reserve(output.columns.size());
-	for (auto &column : output.columns) {
-		projection_column_ids.push_back(column_t(column.working_column_index));
-	}
-
-	auto &allocator = Allocator::Get(context);
-	GroupedAggregateHashTable distinct_table(context, allocator, types);
-	DataChunk projected_chunk;
-	DataChunk empty_payload;
-	unsafe_vector<idx_t> filter;
-
-	ColumnDataScanState relation_scan_state;
-	relation.InitializeScan(relation_scan_state, projection_column_ids);
-	relation.InitializeScanChunk(relation_scan_state, projected_chunk);
-	while (relation.Scan(relation_scan_state, projected_chunk)) {
-		distinct_table.AddChunk(projected_chunk, empty_payload, filter);
-	}
-
+MaterializeResultDBDirectOutput(ClientContext &context, QueryResultMemoryType memory_type,
+                                const vector<LogicalType> &types, GroupedAggregateHashTable &distinct_table) {
 	auto collection = CreateResultDBDirectCollection(context, memory_type, types);
 	ColumnDataAppendState append_state;
 	collection->InitializeAppend(append_state);
@@ -283,6 +72,7 @@ BuildResultDBDirectOutputCollection(ClientContext &context, QueryResultMemoryTyp
 	AggregateHTScanState distinct_scan_state;
 	DataChunk distinct_rows;
 	DataChunk payload_rows;
+	auto &allocator = Allocator::Get(context);
 	distinct_rows.Initialize(allocator, types);
 	distinct_table.InitializeScan(distinct_scan_state);
 	while (true) {
@@ -303,24 +93,54 @@ PhysicalResultDBDirectCollector::PhysicalResultDBDirectCollector(PhysicalPlan &p
     : PhysicalResultCollector(physical_plan, data), program(GetPreparedResultDBYannakakisProgram(data)) {
 	if (program.relations.empty() || program.base_plans.size() != program.relations.size() ||
 	    program.relation_phases.size() != program.relations.size() ||
+	    program.required_for_output.size() != program.relations.size() ||
 	    program.root_relation >= program.relations.size()) {
 		throw InternalException("ResultDB direct collector expected a prepared phase program");
+	}
+	if (!program.edges.empty() &&
+	    (program.parent.size() != program.relations.size() ||
+	     program.order.size() != program.relations.size())) {
+		throw InternalException("ResultDB direct collector expected a complete rooted phase program");
+	}
+	if (program.outputs.size() != properties.resultdb.tables.size()) {
+		throw InternalException("ResultDB direct output metadata does not match the prepared program");
+	}
+	vector<uint8_t> seen_output_metadata(properties.resultdb.tables.size(), 0);
+	for (auto &output : program.outputs) {
+		if (output.table_metadata_index >= seen_output_metadata.size() ||
+		    seen_output_metadata[output.table_metadata_index]) {
+			throw InternalException("ResultDB direct output metadata indexes are not a permutation");
+		}
+		seen_output_metadata[output.table_metadata_index] = 1;
+		auto &table = properties.resultdb.tables[output.table_metadata_index];
+		if (output.columns.size() != table.columns.size()) {
+			throw InternalException("ResultDB direct output column count does not match its public metadata");
+		}
+		for (idx_t column_idx = 0; column_idx < output.columns.size(); column_idx++) {
+			if (output.columns[column_idx].name != table.columns[column_idx].name ||
+			    output.columns[column_idx].type != table.columns[column_idx].type) {
+				throw InternalException("ResultDB direct output column does not match its public metadata");
+			}
+		}
 	}
 	for (auto &base_plan : program.base_plans) {
 		base_plans.push_back(base_plan->Root());
 	}
 
-	bottom_up_phases.resize(program.relations.size());
+	auto relation_count = program.relations.size();
+	bottom_up_phases.resize(relation_count);
+	top_down_phases.resize(relation_count);
+	output_distinct_indexes.assign(program.outputs.size(), DConstants::INVALID_INDEX);
 	root_bottom_up_phase = make_uniq<PhysicalResultDBYannakakisPhase>(
 	    physical_plan, base_plans[program.root_relation], program.root_relation,
-	    program.relations[program.root_relation].types, memory_type, true, "RESULTDB_BOTTOM_UP_ROOT");
+	    program.relations[program.root_relation].types, memory_type, false, "RESULTDB_ROOT_FULL");
 	// A multi-relation program without edges is the existing statically-empty
 	// special case. Its root stream is sufficient to initialize the collector;
 	// GetResult constructs every typed empty output directly.
-	if (program.edges.empty()) {
+	if (program.edges.empty() && relation_count > 1) {
 		return;
 	}
-	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
+	for (idx_t relation_idx = 0; relation_idx < relation_count; relation_idx++) {
 		if (relation_idx == program.root_relation) {
 			continue;
 		}
@@ -330,7 +150,7 @@ PhysicalResultDBDirectCollector::PhysicalResultDBDirectCollector(PhysicalPlan &p
 	}
 
 	// Every non-root relation builds exactly one child-to-parent key set.
-	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
+	for (idx_t relation_idx = 0; relation_idx < relation_count; relation_idx++) {
 		if (relation_idx == program.root_relation) {
 			continue;
 		}
@@ -349,7 +169,7 @@ PhysicalResultDBDirectCollector::PhysicalResultDBDirectCollector(PhysicalPlan &p
 
 	// A parent probes every finalized child key set in the canonical prepared
 	// bottom-up order. The root delegates its sink interface to root_bottom_up_phase.
-	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
+	for (idx_t relation_idx = 0; relation_idx < relation_count; relation_idx++) {
 		auto &consumer = relation_idx == program.root_relation ? *root_bottom_up_phase
 		                                                       : *bottom_up_phases[relation_idx];
 		for (auto step_idx : program.relation_phases[relation_idx].bottom_up_from_children_steps) {
@@ -360,7 +180,104 @@ PhysicalResultDBDirectCollector::PhysicalResultDBDirectCollector(PhysicalPlan &p
 			if (child_relation == program.root_relation || !bottom_up_phases[child_relation]) {
 				throw InternalException("ResultDB bottom-up phase references an invalid child producer");
 			}
-			consumer.AddInputKey(*bottom_up_phases[child_relation], 0);
+			consumer.AddInputKey(
+			    ResultDBYannakakisPhaseHandle(*bottom_up_phases[child_relation],
+			                                  *bottom_up_phases[child_relation]),
+			    0);
+		}
+	}
+
+	auto configure_outputs = [&](PhysicalResultDBYannakakisPhase &phase, idx_t relation_idx) {
+		for (auto output_idx : program.relation_phases[relation_idx].output_indexes) {
+			if (output_idx >= program.outputs.size() ||
+			    program.outputs[output_idx].relation != relation_idx ||
+			    output_distinct_indexes[output_idx] != DConstants::INVALID_INDEX) {
+				throw InternalException("ResultDB full phase references an invalid output");
+			}
+			auto &output = program.outputs[output_idx];
+			vector<idx_t> projection_columns;
+			projection_columns.reserve(output.columns.size());
+			for (auto &column : output.columns) {
+				projection_columns.push_back(column.working_column_index);
+			}
+			output_distinct_indexes[output_idx] =
+			    phase.AddOutputDistinct(std::move(projection_columns),
+			                            GetResultDBDirectOutputTypes(output));
+		}
+	};
+
+	vector<idx_t> downward_key_indexes(program.top_down_steps.size(), DConstants::INVALID_INDEX);
+	auto configure_downward_keys = [&](PhysicalResultDBYannakakisPhase &phase, idx_t relation_idx) {
+		for (auto step_idx : program.relation_phases[relation_idx].top_down_to_children_steps) {
+			if (step_idx >= program.top_down_steps.size() ||
+			    downward_key_indexes[step_idx] != DConstants::INVALID_INDEX) {
+				throw InternalException("ResultDB full phase references an invalid downward reduction");
+			}
+			auto &step = program.top_down_steps[step_idx];
+			if (step.source_relation != relation_idx) {
+				throw InternalException("ResultDB downward key is attached to the wrong producer");
+			}
+			downward_key_indexes[step_idx] =
+			    phase.AddOutputKey(step.source_columns, program.relations[step.target_relation].types,
+			                       step.target_columns);
+		}
+	};
+
+	configure_downward_keys(*root_bottom_up_phase, program.root_relation);
+	configure_outputs(*root_bottom_up_phase, program.root_relation);
+
+	// Create top-down phases in root-to-leaf order. Each phase owns a runtime
+	// scan of its retained bottom-up survivors, probes the already-finalized
+	// parent downward key, and simultaneously produces outputs and child keys.
+	for (idx_t order_idx = 1; order_idx < program.order.size(); order_idx++) {
+		auto relation_idx = program.order[order_idx];
+		if (!program.required_for_output[relation_idx]) {
+			continue;
+		}
+		auto step_idx = program.relation_phases[relation_idx].top_down_from_parent_step;
+		if (step_idx >= program.top_down_steps.size()) {
+			throw InternalException("ResultDB top-down phase is missing its parent reduction");
+		}
+		auto &step = program.top_down_steps[step_idx];
+		if (step.target_relation != relation_idx || step.source_relation != program.parent[relation_idx] ||
+		    downward_key_indexes[step_idx] == DConstants::INVALID_INDEX) {
+			throw InternalException("ResultDB top-down phase has an invalid parent reduction");
+		}
+		auto parent_relation = step.source_relation;
+		PhysicalResultDBYannakakisPhase *parent_phase;
+		PhysicalOperator *parent_state_owner;
+		if (parent_relation == program.root_relation) {
+			parent_phase = root_bottom_up_phase.get();
+			parent_state_owner = this;
+		} else {
+			if (!top_down_phases[parent_relation]) {
+				throw InternalException("ResultDB top-down parent phase was not prepared first");
+			}
+			parent_phase = top_down_phases[parent_relation].get();
+			parent_state_owner = parent_phase;
+		}
+		if (!bottom_up_phases[relation_idx] ||
+		    !program.relation_phases[relation_idx].retain_bottom_up) {
+			throw InternalException("ResultDB top-down phase has no retained bottom-up producer");
+		}
+
+		ResultDBYannakakisPhaseHandle retained_handle(*bottom_up_phases[relation_idx],
+		                                             *bottom_up_phases[relation_idx]);
+		ResultDBYannakakisPhaseHandle parent_handle(*parent_phase, *parent_state_owner);
+		auto retained_scan = make_uniq<PhysicalResultDBYannakakisRetainedScan>(
+		    physical_plan, program.relations[relation_idx].types, retained_handle, parent_handle,
+		    downward_key_indexes[step_idx]);
+		top_down_phases[relation_idx] = make_uniq<PhysicalResultDBYannakakisPhase>(
+		    physical_plan, std::move(retained_scan), relation_idx, program.relations[relation_idx].types,
+		    memory_type, "RESULTDB_TOP_DOWN");
+		top_down_phases[relation_idx]->AddInputKey(parent_handle, downward_key_indexes[step_idx]);
+		configure_downward_keys(*top_down_phases[relation_idx], relation_idx);
+		configure_outputs(*top_down_phases[relation_idx], relation_idx);
+	}
+
+	for (idx_t output_idx = 0; output_idx < output_distinct_indexes.size(); output_idx++) {
+		if (output_distinct_indexes[output_idx] == DConstants::INVALID_INDEX) {
+			throw InternalException("ResultDB output has no full phase DISTINCT producer");
 		}
 	}
 }
@@ -397,56 +314,40 @@ unique_ptr<QueryResult> PhysicalResultDBDirectCollector::GetResult(GlobalSinkSta
 	}
 
 	auto context = root_bottom_up_phase->GetClientContext(state);
-	vector<unique_ptr<ColumnDataCollection>> relation_collections(program.relations.size());
-	relation_collections[program.root_relation] = root_bottom_up_phase->TakeRetainedRows(state);
-	for (idx_t relation_idx = 0; relation_idx < program.relations.size(); relation_idx++) {
-		if (relation_idx == program.root_relation || !program.relation_phases[relation_idx].retain_bottom_up) {
+	if (properties.resultdb.tables.size() != program.outputs.size()) {
+		throw InternalException("ResultDB direct output metadata does not match the prepared program");
+	}
+	auto statically_empty = program.edges.empty() && program.relations.size() > 1;
+	vector<unique_ptr<ColumnDataCollection>> output_collections(properties.resultdb.tables.size());
+	for (idx_t output_idx = 0; output_idx < program.outputs.size(); output_idx++) {
+		auto &output = program.outputs[output_idx];
+		auto types = GetResultDBDirectOutputTypes(output);
+		if (statically_empty) {
+			output_collections[output.table_metadata_index] =
+			    CreateResultDBDirectCollection(*context, memory_type, types);
 			continue;
 		}
-		auto &phase = *bottom_up_phases[relation_idx];
-		if (!phase.sink_state) {
-			throw InternalException("ResultDB bottom-up phase did not initialize its retained relation");
+		if (output_distinct_indexes[output_idx] == DConstants::INVALID_INDEX) {
+			throw InternalException("ResultDB direct output DISTINCT producer is missing");
 		}
-		relation_collections[relation_idx] = phase.TakeRetainedRows(*phase.sink_state);
-	}
 
-	auto globally_empty =
-	    ExecuteResultDBDirectTopDown(*context, memory_type, *this, program, relation_collections);
-
-	vector<idx_t> remaining_output_uses(program.relations.size(), 0);
-	for (auto &output : program.outputs) {
-		remaining_output_uses[output.relation]++;
-	}
-	if (!globally_empty) {
-		for (idx_t relation_idx = 0; relation_idx < relation_collections.size(); relation_idx++) {
-			if (remaining_output_uses[relation_idx] == 0) {
-				relation_collections[relation_idx].reset();
-			}
-		}
-	}
-
-	vector<unique_ptr<ColumnDataCollection>> output_collections;
-	output_collections.resize(properties.resultdb.tables.size());
-	for (auto &output : program.outputs) {
-		if (globally_empty) {
-			output_collections[output.table_metadata_index] =
-			    CreateResultDBDirectCollection(*context, memory_type, GetResultDBDirectOutputTypes(output));
+		PhysicalResultDBYannakakisPhase *phase;
+		GlobalSinkState *phase_state;
+		if (output.relation == program.root_relation) {
+			phase = root_bottom_up_phase.get();
+			phase_state = &state;
 		} else {
-			if (!relation_collections[output.relation]) {
-				throw InternalException("ResultDB direct output relation was released too early");
+			if (output.relation >= top_down_phases.size() || !top_down_phases[output.relation] ||
+			    !top_down_phases[output.relation]->sink_state) {
+				throw InternalException("ResultDB direct top-down output phase is unavailable");
 			}
-			output_collections[output.table_metadata_index] =
-			    BuildResultDBDirectOutputCollection(*context, memory_type, output,
-			                                        *relation_collections[output.relation]);
-			if (--remaining_output_uses[output.relation] == 0) {
-				relation_collections[output.relation].reset();
-			}
+			phase = top_down_phases[output.relation].get();
+			phase_state = phase->sink_state.get();
 		}
-	}
-	if (globally_empty) {
-		for (auto &relation : relation_collections) {
-			relation.reset();
-		}
+		auto distinct_table =
+		    phase->TakeOutputDistinct(*phase_state, output_distinct_indexes[output_idx]);
+		output_collections[output.table_metadata_index] =
+		    MaterializeResultDBDirectOutput(*context, memory_type, types, *distinct_table);
 	}
 
 	unique_ptr<QueryResult> first_result;
@@ -478,6 +379,11 @@ vector<const_reference<PhysicalOperator>> PhysicalResultDBDirectCollector::GetCh
 			result.push_back(*bottom_up_phases[relation_idx]);
 		}
 	}
+	for (idx_t relation_idx = 0; relation_idx < top_down_phases.size(); relation_idx++) {
+		if (top_down_phases[relation_idx]) {
+			result.push_back(*top_down_phases[relation_idx]);
+		}
+	}
 	return result;
 }
 
@@ -489,11 +395,20 @@ void PhysicalResultDBDirectCollector::BuildPipelines(Pipeline &current, MetaPipe
 			phase->sink_state.reset();
 		}
 	}
+	for (auto &phase : top_down_phases) {
+		if (phase) {
+			phase->sink_state.reset();
+		}
+	}
 
 	auto &state = meta_pipeline.GetState();
 	state.SetPipelineSource(current, *this);
 
-	vector<shared_ptr<Pipeline>> phase_pipelines(program.relations.size());
+	struct ResultDBPhasePipelines {
+		shared_ptr<Pipeline> completion;
+		vector<shared_ptr<Pipeline>> consumers;
+	};
+	vector<ResultDBPhasePipelines> bottom_up_pipelines(program.relations.size());
 	for (idx_t relation_idx = 0; relation_idx < base_plans.size(); relation_idx++) {
 		PhysicalOperator *phase_sink;
 		if (relation_idx == program.root_relation) {
@@ -505,20 +420,56 @@ void PhysicalResultDBDirectCollector::BuildPipelines(Pipeline &current, MetaPipe
 		}
 		auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *phase_sink);
 		child_meta_pipeline.Build(base_plans[relation_idx].get());
-		phase_pipelines[relation_idx] = child_meta_pipeline.GetBasePipeline();
+		bottom_up_pipelines[relation_idx].completion = child_meta_pipeline.GetBasePipeline();
+		child_meta_pipeline.GetPipelines(bottom_up_pipelines[relation_idx].consumers, false);
 	}
 
 	// A parent phase may start only after every child phase has completed
-	// Combine and synchronous key-table Finalize.
+	// Combine and synchronous key-table Finalize. Add the dependency to every
+	// pipeline sharing the parent sink, including UNION-created pipelines.
 	for (idx_t child_relation = 0; child_relation < program.relations.size(); child_relation++) {
-		if (child_relation == program.root_relation || !phase_pipelines[child_relation]) {
+		if (child_relation == program.root_relation || !bottom_up_pipelines[child_relation].completion) {
 			continue;
 		}
 		auto parent_relation = program.parent[child_relation];
-		if (parent_relation >= phase_pipelines.size() || !phase_pipelines[parent_relation]) {
+		if (parent_relation >= bottom_up_pipelines.size() ||
+		    !bottom_up_pipelines[parent_relation].completion) {
 			throw InternalException("ResultDB bottom-up pipeline has an invalid parent dependency");
 		}
-		phase_pipelines[parent_relation]->AddDependency(phase_pipelines[child_relation]);
+		for (auto &parent_pipeline : bottom_up_pipelines[parent_relation].consumers) {
+			parent_pipeline->AddDependency(bottom_up_pipelines[child_relation].completion);
+		}
+	}
+
+	vector<ResultDBPhasePipelines> top_down_pipelines(program.relations.size());
+	for (idx_t relation_idx = 0; relation_idx < top_down_phases.size(); relation_idx++) {
+		if (!top_down_phases[relation_idx]) {
+			continue;
+		}
+		auto &phase = *top_down_phases[relation_idx];
+		auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, phase);
+		child_meta_pipeline.Build(phase.InputPlan());
+		top_down_pipelines[relation_idx].completion = child_meta_pipeline.GetBasePipeline();
+		child_meta_pipeline.GetPipelines(top_down_pipelines[relation_idx].consumers, false);
+	}
+
+	// Each top-down phase waits for both owners of its runtime inputs:
+	// its own retained bottom-up rows and its parent's finalized downward key.
+	for (idx_t relation_idx = 0; relation_idx < top_down_phases.size(); relation_idx++) {
+		if (!top_down_phases[relation_idx]) {
+			continue;
+		}
+		auto parent_relation = program.parent[relation_idx];
+		auto &parent_completion =
+		    parent_relation == program.root_relation ? bottom_up_pipelines[parent_relation].completion
+		                                             : top_down_pipelines[parent_relation].completion;
+		if (!bottom_up_pipelines[relation_idx].completion || !parent_completion) {
+			throw InternalException("ResultDB top-down pipeline has an invalid phase dependency");
+		}
+		for (auto &consumer_pipeline : top_down_pipelines[relation_idx].consumers) {
+			consumer_pipeline->AddDependency(bottom_up_pipelines[relation_idx].completion);
+			consumer_pipeline->AddDependency(parent_completion);
+		}
 	}
 }
 

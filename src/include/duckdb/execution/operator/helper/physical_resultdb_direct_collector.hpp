@@ -45,6 +45,8 @@ private:
 	vector<reference<PhysicalOperator>> base_plans;
 	unique_ptr<PhysicalResultDBYannakakisPhase> root_bottom_up_phase;
 	vector<unique_ptr<PhysicalResultDBYannakakisPhase>> bottom_up_phases;
+	vector<unique_ptr<PhysicalResultDBYannakakisPhase>> top_down_phases;
+	vector<idx_t> output_distinct_indexes;
 };
 
 } // namespace duckdb
