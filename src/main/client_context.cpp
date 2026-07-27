@@ -423,6 +423,10 @@ BuildResultDBYannakakisAdjacency(const ResultDBYannakakisProgram &program) {
 	adjacency.resize(program.relations.size());
 	for (idx_t edge_idx = 0; edge_idx < program.edges.size(); edge_idx++) {
 		auto &edge = program.edges[edge_idx];
+		if (edge.left_relation >= program.relations.size() || edge.right_relation >= program.relations.size() ||
+		    edge.left_relation == edge.right_relation) {
+			throw InternalException("ResultDB Yannakakis edge has invalid relation endpoints");
+		}
 		adjacency[edge.left_relation].emplace_back(edge.right_relation, edge_idx);
 		adjacency[edge.right_relation].emplace_back(edge.left_relation, edge_idx);
 	}
@@ -433,6 +437,9 @@ static void BuildResultDBYannakakisOrder(const ResultDBYannakakisProgram &progra
                                          const vector<vector<std::pair<idx_t, idx_t>>> &adjacency,
                                          vector<idx_t> &parent, vector<idx_t> &parent_edge, vector<idx_t> &order) {
 	auto relation_count = program.relations.size();
+	if (relation_count == 0 || program.root_relation >= relation_count || adjacency.size() != relation_count) {
+		throw InternalException("ResultDB Yannakakis program has an invalid root relation");
+	}
 	parent.assign(relation_count, DConstants::INVALID_INDEX);
 	parent_edge.assign(relation_count, DConstants::INVALID_INDEX);
 	vector<bool> visited(relation_count, false);
@@ -453,6 +460,185 @@ static void BuildResultDBYannakakisOrder(const ResultDBYannakakisProgram &progra
 		}
 	}
 	D_ASSERT(order.size() == relation_count);
+}
+
+static idx_t GetPreparedResultDBEdgeColumn(const ResultDBYannakakisEdge &edge, idx_t relation_idx,
+                                           const ResultDBYannakakisJoinColumn &column) {
+	if (edge.left_relation == relation_idx) {
+		return column.left_column_index;
+	}
+	if (edge.right_relation == relation_idx) {
+		return column.right_column_index;
+	}
+	throw InternalException("ResultDB Yannakakis edge does not contain scheduled relation");
+}
+
+static PreparedResultDBYannakakisReductionStep
+BuildPreparedResultDBReductionStep(const PreparedResultDBYannakakisProgram &program, idx_t target_relation,
+                                   idx_t source_relation, idx_t edge_idx) {
+	if (target_relation >= program.relations.size() || source_relation >= program.relations.size()) {
+		throw InternalException("ResultDB Yannakakis reduction step has an out-of-range relation");
+	}
+	if (edge_idx >= program.edges.size()) {
+		throw InternalException("ResultDB Yannakakis reduction step has an out-of-range edge");
+	}
+	auto &edge = program.edges[edge_idx];
+	if (edge.columns.empty()) {
+		throw InternalException("ResultDB Yannakakis reduction edge has no equality columns");
+	}
+	if (!((edge.left_relation == target_relation && edge.right_relation == source_relation) ||
+	      (edge.left_relation == source_relation && edge.right_relation == target_relation))) {
+		throw InternalException("ResultDB Yannakakis reduction edge does not match scheduled relations");
+	}
+
+	PreparedResultDBYannakakisReductionStep result;
+	result.target_relation = target_relation;
+	result.source_relation = source_relation;
+	result.target_columns.reserve(edge.columns.size());
+	result.source_columns.reserve(edge.columns.size());
+	for (auto &column : edge.columns) {
+		auto target_column = GetPreparedResultDBEdgeColumn(edge, target_relation, column);
+		auto source_column = GetPreparedResultDBEdgeColumn(edge, source_relation, column);
+		if (target_column >= program.relations[target_relation].types.size() ||
+		    source_column >= program.relations[source_relation].types.size()) {
+			throw InternalException("ResultDB Yannakakis reduction column is out of range");
+		}
+		if (program.relations[target_relation].types[target_column] !=
+		    program.relations[source_relation].types[source_column]) {
+			throw InternalException("ResultDB Yannakakis reduction key types do not match");
+		}
+		result.target_columns.push_back(target_column);
+		result.source_columns.push_back(source_column);
+	}
+	return result;
+}
+
+void PreparedResultDBYannakakisProgram::BuildReductionSchedule() {
+	bottom_up_steps.clear();
+	top_down_steps.clear();
+	required_for_output.assign(relations.size(), 0);
+
+	if (relations.empty()) {
+		throw InternalException("ResultDB Yannakakis program has no relations");
+	}
+	if (outputs.empty()) {
+		throw InternalException("ResultDB Yannakakis program has no output relations");
+	}
+	if (root_relation >= relations.size()) {
+		throw InternalException("ResultDB Yannakakis root relation is out of range");
+	}
+	for (auto &relation : relations) {
+		if (relation.names.size() != relation.types.size()) {
+			throw InternalException("ResultDB Yannakakis relation names and types do not align");
+		}
+	}
+	vector<uint8_t> seen_output_metadata(outputs.size(), 0);
+	for (auto &output : outputs) {
+		if (output.relation >= relations.size()) {
+			throw InternalException("ResultDB Yannakakis output relation is out of range");
+		}
+		if (output.table_metadata_index >= outputs.size() || seen_output_metadata[output.table_metadata_index]) {
+			throw InternalException("ResultDB Yannakakis output metadata indexes are not a permutation");
+		}
+		seen_output_metadata[output.table_metadata_index] = 1;
+		for (auto &column : output.columns) {
+			if (column.working_column_index >= relations[output.relation].types.size() ||
+			    relations[output.relation].types[column.working_column_index] != column.type) {
+				throw InternalException("ResultDB Yannakakis output column is invalid");
+			}
+		}
+	}
+	for (auto &edge : edges) {
+		if (edge.left_relation >= relations.size() || edge.right_relation >= relations.size() ||
+		    edge.left_relation == edge.right_relation || edge.columns.empty()) {
+			throw InternalException("ResultDB Yannakakis edge is invalid");
+		}
+		for (auto &column : edge.columns) {
+			if (column.left_column_index >= relations[edge.left_relation].types.size() ||
+			    column.right_column_index >= relations[edge.right_relation].types.size()) {
+				throw InternalException("ResultDB Yannakakis edge column is out of range");
+			}
+			if (relations[edge.left_relation].types[column.left_column_index] !=
+			    relations[edge.right_relation].types[column.right_column_index]) {
+				throw InternalException("ResultDB Yannakakis edge key types do not match");
+			}
+		}
+	}
+
+	// A statically empty ResultDB program can contain several disconnected empty relations and no edges.
+	if (edges.empty()) {
+		for (auto &output : outputs) {
+			required_for_output[output.relation] = 1;
+		}
+		return;
+	}
+	if (edges.size() + 1 != relations.size()) {
+		throw InternalException("ResultDB Yannakakis reduction graph is not a tree");
+	}
+	if (order.size() != relations.size() || parent.size() != relations.size() ||
+	    parent_edge.size() != relations.size() || order.empty() || order[0] != root_relation) {
+		throw InternalException("ResultDB Yannakakis program has an invalid rooted relation order");
+	}
+
+	vector<uint8_t> seen(relations.size(), 0);
+	vector<idx_t> order_position(relations.size(), DConstants::INVALID_INDEX);
+	for (idx_t order_idx = 0; order_idx < order.size(); order_idx++) {
+		auto relation_idx = order[order_idx];
+		if (relation_idx >= relations.size() || seen[relation_idx]) {
+			throw InternalException("ResultDB Yannakakis relation order is not a permutation");
+		}
+		seen[relation_idx] = 1;
+		order_position[relation_idx] = order_idx;
+	}
+	if (parent[root_relation] != DConstants::INVALID_INDEX || parent_edge[root_relation] != DConstants::INVALID_INDEX) {
+		throw InternalException("ResultDB Yannakakis root unexpectedly has a parent");
+	}
+	vector<uint8_t> seen_parent_edge(edges.size(), 0);
+	for (idx_t relation_idx = 0; relation_idx < relations.size(); relation_idx++) {
+		if (relation_idx == root_relation) {
+			continue;
+		}
+		if (parent[relation_idx] >= relations.size() || parent_edge[relation_idx] >= edges.size() ||
+		    order_position[parent[relation_idx]] >= order_position[relation_idx] ||
+		    seen_parent_edge[parent_edge[relation_idx]]) {
+			throw InternalException("ResultDB Yannakakis rooted tree is invalid");
+		}
+		seen_parent_edge[parent_edge[relation_idx]] = 1;
+	}
+
+	for (auto &output : outputs) {
+		auto relation_idx = output.relation;
+		while (!required_for_output[relation_idx]) {
+			required_for_output[relation_idx] = 1;
+			if (relation_idx == root_relation) {
+				break;
+			}
+			if (parent[relation_idx] >= relations.size()) {
+				throw InternalException("ResultDB Yannakakis output path has an invalid parent");
+			}
+			relation_idx = parent[relation_idx];
+		}
+	}
+
+	bottom_up_steps.reserve(relations.size() - 1);
+	for (idx_t order_offset = order.size(); order_offset > 0; order_offset--) {
+		auto child = order[order_offset - 1];
+		if (child == root_relation) {
+			continue;
+		}
+		bottom_up_steps.push_back(
+		    BuildPreparedResultDBReductionStep(*this, parent[child], child, parent_edge[child]));
+	}
+
+	top_down_steps.reserve(relations.size() - 1);
+	for (idx_t order_idx = 1; order_idx < order.size(); order_idx++) {
+		auto child = order[order_idx];
+		if (!required_for_output[child]) {
+			continue;
+		}
+		top_down_steps.push_back(
+		    BuildPreparedResultDBReductionStep(*this, child, parent[child], parent_edge[child]));
+	}
 }
 
 static unique_ptr<PhysicalPlan> PlanResultDBYannakakisPhase(ClientContext &context, Binder &binder,
@@ -507,6 +693,7 @@ PrepareResultDBYannakakisProgram(ClientContext &context, Binder &binder, ResultD
 		    PlanResultDBYannakakisPhase(context, binder, std::move(relation.base_plan), optimize));
 		prepared->relations.push_back(std::move(relation));
 	}
+	prepared->BuildReductionSchedule();
 	return prepared;
 }
 

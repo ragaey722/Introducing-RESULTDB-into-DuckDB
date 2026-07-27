@@ -62,6 +62,13 @@ struct ResultDBYannakakisOutputTable {
 	vector<ResultDBYannakakisOutputColumn> columns;
 };
 
+struct PreparedResultDBYannakakisReductionStep {
+	idx_t target_relation = DConstants::INVALID_INDEX;
+	idx_t source_relation = DConstants::INVALID_INDEX;
+	vector<idx_t> target_columns;
+	vector<idx_t> source_columns;
+};
+
 struct ResultDBYannakakisProgram {
 	idx_t root_relation = DConstants::INVALID_INDEX;
 	vector<idx_t> parent;
@@ -82,6 +89,15 @@ struct PreparedResultDBYannakakisProgram {
 	vector<ResultDBYannakakisOutputTable> outputs;
 	//! Physical plans that materialize each base/folded relation once before in-memory Yannakakis reduction.
 	vector<unique_ptr<PhysicalPlan>> base_plans;
+	//! Every child-to-parent reduction, in execution order.
+	vector<PreparedResultDBYannakakisReductionStep> bottom_up_steps;
+	//! Only parent-to-child reductions needed to fully reduce requested output relations.
+	vector<PreparedResultDBYannakakisReductionStep> top_down_steps;
+	//! Whether a relation lies on a root-to-output path and must remain live through top-down reduction.
+	vector<uint8_t> required_for_output;
+
+	//! Validates the tree program and compiles oriented, output-directed reduction steps.
+	void BuildReductionSchedule();
 };
 
 } // namespace duckdb

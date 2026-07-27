@@ -85,26 +85,6 @@ static StatementProperties GetResultDBSingleTableProperties(StatementProperties 
 	return properties;
 }
 
-static idx_t GetResultDBDirectEdgeColumn(const ResultDBYannakakisEdge &edge, idx_t relation_idx,
-                                         const ResultDBYannakakisJoinColumn &column) {
-	if (edge.left_relation == relation_idx) {
-		return column.left_column_index;
-	}
-	if (edge.right_relation == relation_idx) {
-		return column.right_column_index;
-	}
-	throw InternalException("ResultDB Yannakakis edge does not contain relation");
-}
-
-static vector<idx_t> GetResultDBDirectEdgeColumns(const ResultDBYannakakisEdge &edge, idx_t relation_idx) {
-	vector<idx_t> result;
-	result.reserve(edge.columns.size());
-	for (auto &column : edge.columns) {
-		result.push_back(GetResultDBDirectEdgeColumn(edge, relation_idx, column));
-	}
-	return result;
-}
-
 static vector<LogicalType> GetResultDBDirectColumnTypes(const vector<LogicalType> &input_types,
                                                         const vector<idx_t> &columns) {
 	vector<LogicalType> result;
@@ -245,48 +225,66 @@ ApplyResultDBDirectSemijoin(ClientContext &context, QueryResultMemoryType memory
 	return output;
 }
 
-static void ExecuteResultDBDirectReduction(ClientContext &context, QueryResultMemoryType memory_type,
+static bool ExecuteResultDBDirectReduction(ClientContext &context, QueryResultMemoryType memory_type,
                                            const PhysicalOperator &op,
                                            const PreparedResultDBYannakakisProgram &program,
                                            vector<unique_ptr<ColumnDataCollection>> &relations) {
-	if (program.edges.empty()) {
-		return;
-	}
-	if (program.order.empty()) {
-		throw InternalException("ResultDB Yannakakis program is missing relation order");
+	if (program.root_relation >= relations.size()) {
+		throw InternalException("ResultDB Yannakakis program has an invalid root relation");
 	}
 
-	auto reduce = [&](idx_t target, idx_t source, idx_t edge_idx) {
-		auto &edge = program.edges[edge_idx];
-		auto target_columns = GetResultDBDirectEdgeColumns(edge, target);
-		auto source_columns = GetResultDBDirectEdgeColumns(edge, source);
-		relations[target] = ApplyResultDBDirectSemijoin(context, memory_type, op, *relations[target],
-		                                                *relations[source], target_columns, source_columns);
+	auto reduce = [&](const PreparedResultDBYannakakisReductionStep &step) {
+		if (step.target_relation >= relations.size() || step.source_relation >= relations.size() ||
+		    !relations[step.target_relation] || !relations[step.source_relation]) {
+			throw InternalException("ResultDB Yannakakis reduction references an unavailable relation");
+		}
+		auto &target = relations[step.target_relation];
+		auto &source = relations[step.source_relation];
+		if (target->Count() == 0) {
+			return;
+		}
+		if (source->Count() == 0) {
+			target = CreateResultDBDirectCollection(context, memory_type, target->Types());
+			return;
+		}
+		target = ApplyResultDBDirectSemijoin(context, memory_type, op, *target, *source, step.target_columns,
+		                                    step.source_columns);
 	};
 
-	for (idx_t order_offset = program.order.size(); order_offset > 0; order_offset--) {
-		auto child = program.order[order_offset - 1];
-		if (child != program.root_relation) {
-			reduce(program.parent[child], child, program.parent_edge[child]);
+	for (auto &step : program.bottom_up_steps) {
+		reduce(step);
+		if (!program.required_for_output[step.source_relation]) {
+			relations[step.source_relation].reset();
 		}
 	}
 
-	for (idx_t order_idx = 1; order_idx < program.order.size(); order_idx++) {
-		auto child = program.order[order_idx];
-		reduce(child, program.parent[child], program.parent_edge[child]);
+	if (relations[program.root_relation]->Count() == 0) {
+		return true;
 	}
+
+	for (auto &step : program.top_down_steps) {
+		reduce(step);
+	}
+	return false;
+}
+
+static vector<LogicalType> GetResultDBDirectOutputTypes(const ResultDBYannakakisOutputTable &output) {
+	vector<LogicalType> types;
+	types.reserve(output.columns.size());
+	for (auto &column : output.columns) {
+		types.push_back(column.type);
+	}
+	return types;
 }
 
 static unique_ptr<ColumnDataCollection>
 BuildResultDBDirectOutputCollection(ClientContext &context, QueryResultMemoryType memory_type,
                                     const ResultDBYannakakisOutputTable &output,
                                     const ColumnDataCollection &relation) {
-	vector<LogicalType> types;
-	types.reserve(output.columns.size());
+	auto types = GetResultDBDirectOutputTypes(output);
 	vector<column_t> projection_column_ids;
 	projection_column_ids.reserve(output.columns.size());
 	for (auto &column : output.columns) {
-		types.push_back(column.type);
 		projection_column_ids.push_back(column_t(column.working_column_index));
 	}
 
@@ -381,14 +379,43 @@ unique_ptr<QueryResult> PhysicalResultDBDirectCollector::GetResult(GlobalSinkSta
 		throw InternalException("RESULTDB query has no output tables");
 	}
 
-	ExecuteResultDBDirectReduction(*gstate.context, memory_type, *this, program, gstate.relation_collections);
+	auto globally_empty =
+	    ExecuteResultDBDirectReduction(*gstate.context, memory_type, *this, program, gstate.relation_collections);
+
+	vector<idx_t> remaining_output_uses(program.relations.size(), 0);
+	for (auto &output : program.outputs) {
+		remaining_output_uses[output.relation]++;
+	}
+	if (!globally_empty) {
+		for (idx_t relation_idx = 0; relation_idx < gstate.relation_collections.size(); relation_idx++) {
+			if (remaining_output_uses[relation_idx] == 0) {
+				gstate.relation_collections[relation_idx].reset();
+			}
+		}
+	}
 
 	vector<unique_ptr<ColumnDataCollection>> output_collections;
 	output_collections.resize(properties.resultdb.tables.size());
 	for (auto &output : program.outputs) {
-		output_collections[output.table_metadata_index] =
-		    BuildResultDBDirectOutputCollection(*gstate.context, memory_type, output,
-		                                        *gstate.relation_collections[output.relation]);
+		if (globally_empty) {
+			output_collections[output.table_metadata_index] =
+			    CreateResultDBDirectCollection(*gstate.context, memory_type, GetResultDBDirectOutputTypes(output));
+		} else {
+			if (!gstate.relation_collections[output.relation]) {
+				throw InternalException("ResultDB direct output relation was released too early");
+			}
+			output_collections[output.table_metadata_index] =
+			    BuildResultDBDirectOutputCollection(*gstate.context, memory_type, output,
+			                                        *gstate.relation_collections[output.relation]);
+			if (--remaining_output_uses[output.relation] == 0) {
+				gstate.relation_collections[output.relation].reset();
+			}
+		}
+	}
+	if (globally_empty) {
+		for (auto &relation : gstate.relation_collections) {
+			relation.reset();
+		}
 	}
 
 	unique_ptr<QueryResult> first_result;

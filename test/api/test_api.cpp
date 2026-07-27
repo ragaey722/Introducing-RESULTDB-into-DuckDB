@@ -6,6 +6,8 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/planner/resultdb_reduced_plan.hpp"
+#include "duckdb/common/types/hash.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -13,21 +15,59 @@
 
 using namespace duckdb;
 
-static vector<string> ResultRows(QueryResult &result) {
-	auto &materialized = result.Cast<MaterializedQueryResult>();
-	vector<string> rows;
-	for (idx_t row_idx = 0; row_idx < materialized.RowCount(); row_idx++) {
-		string row;
-		for (idx_t col_idx = 0; col_idx < result.ColumnCount(); col_idx++) {
-			if (col_idx > 0) {
-				row += "|";
-			}
-			row += materialized.GetValue(col_idx, row_idx).ToString();
+using ResultRow = vector<Value>;
+
+struct ResultRowHash {
+	size_t operator()(const ResultRow &row) const {
+		hash_t hash = 0;
+		for (auto &value : row) {
+			hash = CombineHash(hash, value.Hash());
 		}
-		rows.push_back(std::move(row));
+		return NumericCast<size_t>(hash);
 	}
-	std::sort(rows.begin(), rows.end());
+};
+
+struct ResultRowEquality {
+	bool operator()(const ResultRow &left, const ResultRow &right) const {
+		if (left.size() != right.size()) {
+			return false;
+		}
+		for (idx_t column_idx = 0; column_idx < left.size(); column_idx++) {
+			if (!Value::DefaultValuesAreEqual(left[column_idx], right[column_idx])) {
+				return false;
+			}
+		}
+		return true;
+	}
+};
+
+using ResultRowCounts = unordered_map<ResultRow, idx_t, ResultRowHash, ResultRowEquality>;
+
+static ResultRowCounts ResultRows(QueryResult &result) {
+	auto &materialized = result.Cast<MaterializedQueryResult>();
+	ResultRowCounts rows;
+	for (idx_t row_idx = 0; row_idx < materialized.RowCount(); row_idx++) {
+		ResultRow row;
+		row.reserve(result.ColumnCount());
+		for (idx_t col_idx = 0; col_idx < result.ColumnCount(); col_idx++) {
+			row.push_back(materialized.GetValue(col_idx, row_idx));
+		}
+		rows[std::move(row)]++;
+	}
 	return rows;
+}
+
+static bool ResultRowsEqual(const ResultRowCounts &left, const ResultRowCounts &right) {
+	if (left.size() != right.size()) {
+		return false;
+	}
+	for (auto &entry : left) {
+		auto other = right.find(entry.first);
+		if (other == right.end() || other->second != entry.second) {
+			return false;
+		}
+	}
+	return true;
 }
 
 static void RequireResultDBTable(QueryResult &actual, const string &table_name, QueryResult &expected) {
@@ -42,7 +82,7 @@ static void RequireResultDBTable(QueryResult &actual, const string &table_name, 
 		REQUIRE(table.columns[column_idx].type == actual.types[column_idx]);
 	}
 	REQUIRE(actual.names == expected.names);
-	REQUIRE(ResultRows(actual) == ResultRows(expected));
+	REQUIRE(ResultRowsEqual(ResultRows(actual), ResultRows(expected)));
 }
 
 static void RequireResultDBStrategy(QueryResult &actual, ResultDBStrategy requested_strategy,
@@ -728,10 +768,19 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN);
 
 	const string cross_product_where_from = " FROM a, b WHERE a.id = b.a_id";
+	auto expected_cross_product_a = con.Query("SELECT DISTINCT a.id" + cross_product_where_from);
+	auto expected_cross_product_b = con.Query("SELECT DISTINCT b.id, b.a_id" + cross_product_where_from);
+	REQUIRE(!expected_cross_product_a->HasError());
+	REQUIRE(!expected_cross_product_b->HasError());
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
 	result = con.Query("SELECT RESULTDB *" + cross_product_where_from);
 	REQUIRE(!result->HasError());
 	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	RequireResultDBTable(*result, "a", *expected_cross_product_a);
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "b", *expected_cross_product_b);
+	REQUIRE(!result->next);
 
 	const string selective_filter_from = " FROM a JOIN b ON a.id = b.a_id WHERE a.id = 1";
 	auto expected_selective_a = con.Query("SELECT DISTINCT a.id" + selective_filter_from);
@@ -977,6 +1026,154 @@ TEST_CASE("Test ResultDB query returns larger source relation set", "[api]") {
 	RequireResultDBTable(*result, "p", *expected_all_products);
 	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
 	REQUIRE(!result->next);
+}
+
+TEST_CASE("Test ResultDB JOB-shaped occurrence, subset, DISTINCT, and empty semantics", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE people(id INTEGER, manager_id INTEGER, name VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query(
+	    "INSERT INTO people VALUES (1, NULL, 'CEO'), (2, 1, 'Ada'), (3, 1, 'Linus'), (4, 2, 'Grace')"));
+	const string self_join_from =
+	    " FROM people employee, people manager "
+	    "WHERE employee.manager_id = manager.id AND employee.id IN (2, 4)";
+	auto expected_employees = con.Query("SELECT DISTINCT employee.name" + self_join_from);
+	auto expected_managers = con.Query("SELECT DISTINCT manager.name" + self_join_from);
+	REQUIRE(!expected_employees->HasError());
+	REQUIRE(!expected_managers->HasError());
+
+	for (auto &strategy : vector<string> {"decompose", "semijoin"}) {
+		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy + "'"));
+		duckdb::unique_ptr<QueryResult> result =
+		    con.Query("SELECT RESULTDB employee.name, manager.name" + self_join_from);
+		REQUIRE(!result->HasError());
+		auto employee_table_index = result->properties.resultdb.tables[0].table_index;
+		RequireResultDBTable(*result, "employee", *expected_employees);
+		result = std::move(result->next);
+		REQUIRE(result);
+		auto manager_table_index = result->properties.resultdb.tables[0].table_index;
+		REQUIRE(employee_table_index != manager_table_index);
+		RequireResultDBTable(*result, "manager", *expected_managers);
+		REQUIRE(!result->next);
+	}
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE endpoint_a(id INTEGER, label VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE internal_b(id INTEGER, a_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE endpoint_c(id INTEGER, b_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE constraint_d(id INTEGER, b_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO endpoint_a VALUES (1, 'keep'), (2, 'drop')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO internal_b VALUES (10, 1), (20, 2)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO endpoint_c VALUES (100, 10), (200, 20)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO constraint_d VALUES (1000, 10)"));
+	const string selected_endpoints_from =
+	    " FROM endpoint_a a "
+	    "JOIN internal_b b ON a.id = b.a_id "
+	    "JOIN endpoint_c c ON b.id = c.b_id "
+	    "JOIN constraint_d d ON b.id = d.b_id";
+	auto expected_endpoint_a = con.Query("SELECT DISTINCT a.label" + selected_endpoints_from);
+	auto expected_endpoint_c = con.Query("SELECT DISTINCT c.id" + selected_endpoints_from);
+	REQUIRE(!expected_endpoint_a->HasError());
+	REQUIRE(!expected_endpoint_c->HasError());
+
+	for (auto &strategy : vector<string> {"decompose", "semijoin"}) {
+		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy + "'"));
+		duckdb::unique_ptr<QueryResult> result =
+		    con.Query("SELECT RESULTDB a.label, c.id" + selected_endpoints_from);
+		REQUIRE(!result->HasError());
+		RequireResultDBTable(*result, "a", *expected_endpoint_a);
+		REQUIRE(CHECK_COLUMN(result, 0, {"keep"}));
+		result = std::move(result->next);
+		REQUIRE(result);
+		RequireResultDBTable(*result, "c", *expected_endpoint_c);
+		REQUIRE(CHECK_COLUMN(result, 0, {100}));
+		REQUIRE(!result->next);
+	}
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE nullable_projection(id INTEGER, note VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE nullable_hits(a_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO nullable_projection VALUES (1, NULL), (2, NULL), (3, 'other')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO nullable_hits VALUES (1), (2)"));
+	const string nullable_projection_from =
+	    " FROM nullable_projection a JOIN nullable_hits b ON a.id = b.a_id";
+	auto expected_nullable = con.Query("SELECT DISTINCT a.note" + nullable_projection_from);
+	REQUIRE(!expected_nullable->HasError());
+
+	for (auto &strategy : vector<string> {"decompose", "semijoin"}) {
+		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy + "'"));
+		duckdb::unique_ptr<QueryResult> result =
+		    con.Query("SELECT RESULTDB a.note" + nullable_projection_from);
+		REQUIRE(!result->HasError());
+		RequireResultDBTable(*result, "a", *expected_nullable);
+		REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+		REQUIRE(CHECK_COLUMN(result, 0, {Value()}));
+		REQUIRE(!result->next);
+	}
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE empty_a(id INTEGER, label VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE empty_b(id INTEGER, a_id INTEGER, payload VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE empty_c(id INTEGER, b_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO empty_a VALUES (1, 'a1'), (3, 'a3')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO empty_b VALUES (10, 2, 'b2'), (20, 4, 'b4')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO empty_c VALUES (100, 10), (200, 20)"));
+	const string runtime_empty_from =
+	    " FROM empty_a a JOIN empty_b b ON a.id = b.a_id JOIN empty_c c ON b.id = c.b_id";
+	auto expected_empty_a = con.Query("SELECT DISTINCT a.label" + runtime_empty_from);
+	auto expected_empty_b = con.Query("SELECT DISTINCT b.payload" + runtime_empty_from);
+	REQUIRE(!expected_empty_a->HasError());
+	REQUIRE(!expected_empty_b->HasError());
+
+	for (auto &strategy : vector<string> {"decompose", "semijoin"}) {
+		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy + "'"));
+		duckdb::unique_ptr<QueryResult> result =
+		    con.Query("SELECT RESULTDB a.label, b.payload" + runtime_empty_from);
+		REQUIRE(!result->HasError());
+		RequireResultDBTable(*result, "a", *expected_empty_a);
+		REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 0);
+		result = std::move(result->next);
+		REQUIRE(result);
+		RequireResultDBTable(*result, "b", *expected_empty_b);
+		REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 0);
+		REQUIRE(!result->next);
+	}
+}
+
+TEST_CASE("Test ResultDB prepared schedule prunes unrequested top-down branches", "[api]") {
+	PreparedResultDBYannakakisProgram program;
+	program.root_relation = 0;
+	program.parent = {DConstants::INVALID_INDEX, 0, 0, 0};
+	program.parent_edge = {DConstants::INVALID_INDEX, 0, 1, 2};
+	program.order = {0, 1, 2, 3};
+	program.relations.resize(4);
+	for (auto &relation : program.relations) {
+		relation.names = {"value"};
+		relation.types = {LogicalType::INTEGER};
+	}
+	for (idx_t child = 1; child < 4; child++) {
+		ResultDBYannakakisEdge edge;
+		edge.left_relation = 0;
+		edge.right_relation = child;
+		edge.columns.push_back({0, 0});
+		program.edges.push_back(std::move(edge));
+	}
+	ResultDBYannakakisOutputTable output;
+	output.relation = 2;
+	output.table_metadata_index = 0;
+	output.columns.push_back({0, "value", LogicalType::INTEGER});
+	program.outputs.push_back(std::move(output));
+
+	program.BuildReductionSchedule();
+	REQUIRE(program.bottom_up_steps.size() == 3);
+	REQUIRE(program.bottom_up_steps[0].target_relation == 0);
+	REQUIRE(program.bottom_up_steps[0].source_relation == 3);
+	REQUIRE(program.bottom_up_steps[1].target_relation == 0);
+	REQUIRE(program.bottom_up_steps[1].source_relation == 2);
+	REQUIRE(program.bottom_up_steps[2].target_relation == 0);
+	REQUIRE(program.bottom_up_steps[2].source_relation == 1);
+	REQUIRE(program.top_down_steps.size() == 1);
+	REQUIRE(program.top_down_steps[0].target_relation == 2);
+	REQUIRE(program.top_down_steps[0].source_relation == 0);
+	REQUIRE(program.required_for_output == vector<uint8_t> {1, 0, 1, 0});
 }
 
 TEST_CASE("Test streaming API errors", "[api]") {
