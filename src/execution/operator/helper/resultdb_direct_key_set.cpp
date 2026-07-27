@@ -3,6 +3,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/row/partitioned_tuple_data.hpp"
 #include "duckdb/common/types/row/tuple_data_collection.hpp"
+#include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/main/client_context.hpp"
