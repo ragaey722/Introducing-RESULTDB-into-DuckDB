@@ -937,6 +937,9 @@ static unique_ptr<LogicalOperator> BuildResultDBNodeMaterializationPlan(Binder &
 	auto projection_index = binder.GenerateTableIndex();
 	auto projection = make_uniq<LogicalProjection>(projection_index, std::move(projection_expressions));
 	projection->AddChild(std::move(base_plan));
+	if (!node.folded && node.tables.size() == 1) {
+		return std::move(projection);
+	}
 
 	auto distinct = make_uniq<LogicalDistinct>(
 	    BuildResultDBDistinctTargets(relation.names, relation.types, projection_index), DistinctType::DISTINCT);
