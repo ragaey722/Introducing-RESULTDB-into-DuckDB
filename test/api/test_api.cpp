@@ -82,6 +82,7 @@ static void RequireResultDBTable(QueryResult &actual, const string &table_name, 
 		REQUIRE(table.columns[column_idx].type == actual.types[column_idx]);
 	}
 	REQUIRE(actual.names == expected.names);
+	REQUIRE(actual.types == expected.types);
 	REQUIRE(ResultRowsEqual(ResultRows(actual), ResultRows(expected)));
 }
 
@@ -670,6 +671,69 @@ TEST_CASE("Test ResultDB semijoin physical executor handles NULL keys and parall
 	REQUIRE(!result->next);
 }
 
+TEST_CASE("Test ResultDB semijoin reuses fused composite-key phases at T1 and T6", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_a(k1 INTEGER, k2 INTEGER, payload VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_b(a_k1 INTEGER, a_k2 INTEGER, c_k1 INTEGER, c_k2 INTEGER, "
+	                          "payload BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_c(k1 INTEGER, k2 INTEGER, payload BOOLEAN)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_a VALUES "
+	                          "(1, 11, 'a-keep'), (1, 11, 'a-keep'), "
+	                          "(2, 22, 'a-no-c'), (3, 33, NULL), (5, 55, NULL), "
+	                          "(4, NULL, 'a-null-key'), (NULL, 55, 'a-null-key')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_b VALUES "
+	                          "(1, 11, 101, 1001, 1000), (1, 11, 101, 1001, 1000), "
+	                          "(2, 22, 202, 2002, 2000), "
+	                          "(3, 33, 303, 3003, NULL), (5, 55, 505, 5005, NULL), "
+	                          "(4, NULL, 404, 4004, 4000), (NULL, 55, 505, 5005, 5000)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_c VALUES "
+	                          "(101, 1001, TRUE), (101, 1001, TRUE), "
+	                          "(202, 9999, FALSE), (303, 3003, NULL), (505, 5005, NULL), "
+	                          "(NULL, 5005, TRUE)"));
+
+	const string from_clause =
+	    " FROM fused_a a "
+	    "JOIN fused_b b ON a.k1 = b.a_k1 AND a.k2 = b.a_k2 "
+	    "JOIN fused_c c ON b.c_k1 = c.k1 AND b.c_k2 = c.k2";
+	auto expected_a = con.Query("SELECT DISTINCT a.payload" + from_clause);
+	auto expected_b = con.Query("SELECT DISTINCT b.payload" + from_clause);
+	auto expected_c = con.Query("SELECT DISTINCT c.payload" + from_clause);
+	REQUIRE(!expected_a->HasError());
+	REQUIRE(!expected_b->HasError());
+	REQUIRE(!expected_c->HasError());
+	REQUIRE(expected_a->Cast<MaterializedQueryResult>().RowCount() == 2);
+	REQUIRE(expected_b->Cast<MaterializedQueryResult>().RowCount() == 2);
+	REQUIRE(expected_c->Cast<MaterializedQueryResult>().RowCount() == 2);
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	const string resultdb_query = "SELECT RESULTDB a.payload, b.payload, c.payload" + from_clause;
+	for (auto &threads : vector<string> {"1", "6"}) {
+		REQUIRE_NO_FAIL(con.Query("PRAGMA threads=" + threads));
+		auto prepared = con.Prepare(resultdb_query);
+		REQUIRE(!prepared->HasError());
+
+		for (idx_t repetition = 0; repetition < 4; repetition++) {
+			duckdb::unique_ptr<QueryResult> result = prepared->Execute();
+			REQUIRE(!result->HasError());
+			RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+
+			RequireResultDBTable(*result, "a", *expected_a);
+			REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+			result = std::move(result->next);
+			REQUIRE(result);
+			RequireResultDBTable(*result, "b", *expected_b);
+			REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+			result = std::move(result->next);
+			REQUIRE(result);
+			RequireResultDBTable(*result, "c", *expected_c);
+			REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+			REQUIRE(!result->next);
+		}
+	}
+}
+
 TEST_CASE("Test ResultDB semijoin materializes casted equality join keys", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -1139,6 +1203,107 @@ TEST_CASE("Test ResultDB JOB-shaped occurrence, subset, DISTINCT, and empty sema
 	}
 }
 
+TEST_CASE("Test ResultDB top-down child hashes use parent-reduced relay rows", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wave_d(id INTEGER, payload VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wave_b(id INTEGER, d_id INTEGER, a_id INTEGER, c_id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wave_a(id INTEGER, payload VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wave_c(id INTEGER, payload VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wave_d VALUES (1, 'd-keep'), (2, 'd-no-descendant')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wave_b VALUES "
+	                          "(10, 1, 10, 100), "
+	                          "(20, 2, 20, 999), "
+	                          "(30, 3, 30, 300)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wave_a VALUES (10, 'a-keep'), (20, 'a-no-c'), (30, 'a-no-d')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wave_c VALUES "
+	                          "(100, 'c-keep'), (300, 'c-must-be-filtered-by-d'), (400, 'c-unrelated')"));
+
+	const string from_clause =
+	    " FROM wave_d d "
+	    "JOIN wave_b b ON d.id = b.d_id "
+	    "JOIN wave_a a ON b.a_id = a.id "
+	    "JOIN wave_c c ON b.c_id = c.id";
+	auto expected_d = con.Query("SELECT DISTINCT d.payload" + from_clause);
+	auto expected_c = con.Query("SELECT DISTINCT c.payload" + from_clause);
+	REQUIRE(!expected_d->HasError());
+	REQUIRE(!expected_c->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	duckdb::unique_ptr<QueryResult> result =
+	    con.Query("SELECT RESULTDB d.payload, c.payload" + from_clause);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 3);
+	RequireResultDBTable(*result, "d", *expected_d);
+	REQUIRE(CHECK_COLUMN(result, 0, {"d-keep"}));
+	result = std::move(result->next);
+	REQUIRE(result);
+	RequireResultDBTable(*result, "c", *expected_c);
+	REQUIRE(CHECK_COLUMN(result, 0, {"c-keep"}));
+	REQUIRE(!result->next);
+
+	// With only D requested, B, A, and C still constrain D but need no top-down output phase.
+	result = con.Query("SELECT RESULTDB d.payload" + from_clause);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	RequireResultDBTable(*result, "d", *expected_d);
+	REQUIRE(CHECK_COLUMN(result, 0, {"d-keep"}));
+	REQUIRE(!result->next);
+}
+
+TEST_CASE("Test ResultDB folded relations preserve occurrence outputs with hidden join keys", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fold_a(id INTEGER, payload VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fold_b(id INTEGER, a_id INTEGER, payload BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fold_c(id INTEGER, b_id INTEGER, a_id INTEGER, note VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO fold_a VALUES (1, 'fa-1'), (2, 'fa-2')"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO fold_b VALUES (10, 1, 1000), (20, 2, 2000)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO fold_c VALUES "
+	                          "(100, 10, 1, NULL), (100, 10, 1, NULL), "
+	                          "(200, 20, 2, NULL), (300, 10, 2, 'cycle-invalid')"));
+
+	const string from_clause =
+	    " FROM fold_a fa "
+	    "JOIN fold_b fb ON fa.id = fb.a_id "
+	    "JOIN fold_c fc ON fb.id = fc.b_id AND fa.id = fc.a_id";
+	auto expected_a = con.Query("SELECT DISTINCT fa.payload" + from_clause);
+	auto expected_b = con.Query("SELECT DISTINCT fb.payload" + from_clause);
+	auto expected_c = con.Query("SELECT DISTINCT fc.note" + from_clause);
+	REQUIRE(!expected_a->HasError());
+	REQUIRE(!expected_b->HasError());
+	REQUIRE(!expected_c->HasError());
+
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
+	duckdb::unique_ptr<QueryResult> result =
+	    con.Query("SELECT RESULTDB fa.payload, fb.payload, fc.note" + from_clause);
+	REQUIRE(!result->HasError());
+	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
+	REQUIRE(result->properties.resultdb.join_edges.size() == 3);
+
+	auto fa_table_index = result->properties.resultdb.tables[0].table_index;
+	RequireResultDBTable(*result, "fa", *expected_a);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+	result = std::move(result->next);
+	REQUIRE(result);
+	auto fb_table_index = result->properties.resultdb.tables[0].table_index;
+	RequireResultDBTable(*result, "fb", *expected_b);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+	result = std::move(result->next);
+	REQUIRE(result);
+	auto fc_table_index = result->properties.resultdb.tables[0].table_index;
+	RequireResultDBTable(*result, "fc", *expected_c);
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 1);
+	REQUIRE(CHECK_COLUMN(result, 0, {Value()}));
+	REQUIRE(fa_table_index != fb_table_index);
+	REQUIRE(fa_table_index != fc_table_index);
+	REQUIRE(fb_table_index != fc_table_index);
+	REQUIRE(!result->next);
+}
+
 TEST_CASE("Test ResultDB prepared schedule prunes unrequested top-down branches", "[api]") {
 	PreparedResultDBYannakakisProgram program;
 	program.root_relation = 0;
@@ -1190,6 +1355,59 @@ TEST_CASE("Test ResultDB prepared schedule prunes unrequested top-down branches"
 	REQUIRE(program.relation_phases[3].bottom_up_to_parent_step == 0);
 	REQUIRE(program.relation_phases[3].top_down_from_parent_step == DConstants::INVALID_INDEX);
 	REQUIRE(!program.relation_phases[3].retain_bottom_up);
+}
+
+TEST_CASE("Test ResultDB root-only prepared phases keep all children hash-only", "[api]") {
+	PreparedResultDBYannakakisProgram program;
+	program.root_relation = 0;
+	program.parent = {DConstants::INVALID_INDEX, 0, 0, 0};
+	program.parent_edge = {DConstants::INVALID_INDEX, 0, 1, 2};
+	program.order = {0, 1, 2, 3};
+	program.relations.resize(4);
+	for (auto &relation : program.relations) {
+		relation.names = {"value"};
+		relation.types = {LogicalType::INTEGER};
+	}
+	for (idx_t child = 1; child < 4; child++) {
+		ResultDBYannakakisEdge edge;
+		edge.left_relation = 0;
+		edge.right_relation = child;
+		edge.columns.push_back({0, 0});
+		program.edges.push_back(std::move(edge));
+	}
+	ResultDBYannakakisOutputTable output;
+	output.relation = 0;
+	output.table_metadata_index = 0;
+	output.columns.push_back({0, "value", LogicalType::INTEGER});
+	program.outputs.push_back(std::move(output));
+
+	program.BuildReductionSchedule();
+
+	REQUIRE(program.bottom_up_steps.size() == 3);
+	REQUIRE(program.top_down_steps.empty());
+	REQUIRE(program.required_for_output == vector<uint8_t> {1, 0, 0, 0});
+	REQUIRE(program.relation_phases.size() == 4);
+
+	auto &root = program.relation_phases[0];
+	REQUIRE(root.bottom_up_to_parent_step == DConstants::INVALID_INDEX);
+	REQUIRE(root.bottom_up_from_children_steps == vector<idx_t> {0, 1, 2});
+	REQUIRE(root.top_down_from_parent_step == DConstants::INVALID_INDEX);
+	REQUIRE(root.top_down_to_children_steps.empty());
+	REQUIRE(root.output_indexes == vector<idx_t> {0});
+	REQUIRE(!root.retain_bottom_up);
+
+	for (idx_t relation_idx = 1; relation_idx < program.relation_phases.size(); relation_idx++) {
+		auto &phase = program.relation_phases[relation_idx];
+		REQUIRE(phase.bottom_up_to_parent_step != DConstants::INVALID_INDEX);
+		auto &step = program.bottom_up_steps[phase.bottom_up_to_parent_step];
+		REQUIRE(step.source_relation == relation_idx);
+		REQUIRE(step.target_relation == 0);
+		REQUIRE(phase.bottom_up_from_children_steps.empty());
+		REQUIRE(phase.top_down_from_parent_step == DConstants::INVALID_INDEX);
+		REQUIRE(phase.top_down_to_children_steps.empty());
+		REQUIRE(phase.output_indexes.empty());
+		REQUIRE(!phase.retain_bottom_up);
+	}
 }
 
 TEST_CASE("Test ResultDB prepared phases classify root, relay, off-path, and output relations", "[api]") {
