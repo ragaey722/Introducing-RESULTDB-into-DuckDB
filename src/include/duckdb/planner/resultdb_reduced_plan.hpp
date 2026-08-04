@@ -37,6 +37,8 @@ struct ResultDBYannakakisRelation {
 	vector<LogicalType> types;
 	//! Logical plan that produces the filtered/projected working relation. Folded plans retain DISTINCT.
 	unique_ptr<LogicalOperator> base_plan;
+	//! Keep an exact TDFold join tree from being re-enumerated by the per-phase optimizer.
+	bool preserve_join_order = false;
 };
 
 struct ResultDBYannakakisJoinColumn {
@@ -89,6 +91,9 @@ struct ResultDBYannakakisProgram {
 	vector<idx_t> parent;
 	vector<idx_t> parent_edge;
 	vector<idx_t> order;
+	//! Optional explicit sibling orders produced by TDRoot. Empty means use order.
+	vector<vector<idx_t>> bottom_up_children;
+	vector<vector<idx_t>> top_down_children;
 	vector<ResultDBYannakakisRelation> relations;
 	vector<ResultDBYannakakisEdge> edges;
 	vector<ResultDBYannakakisOutputTable> outputs;
@@ -99,6 +104,8 @@ struct PreparedResultDBYannakakisProgram {
 	vector<idx_t> parent;
 	vector<idx_t> parent_edge;
 	vector<idx_t> order;
+	vector<vector<idx_t>> bottom_up_children;
+	vector<vector<idx_t>> top_down_children;
 	vector<ResultDBYannakakisRelation> relations;
 	vector<ResultDBYannakakisEdge> edges;
 	vector<ResultDBYannakakisOutputTable> outputs;

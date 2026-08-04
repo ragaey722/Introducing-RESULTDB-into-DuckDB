@@ -1585,7 +1585,8 @@ struct ResultdbStrategySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "resultdb_strategy";
 	static constexpr const char *Description =
-	    "Execution strategy used for SELECT RESULTDB queries (decompose, semijoin, or auto)";
+	    "Planning strategy used for SELECT RESULTDB queries (decompose, semijoin, tdroot, tdfold_no_tvc, "
+	    "tdfold, or auto)";
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "decompose";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;

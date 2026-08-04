@@ -7,6 +7,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/optimizer/resultdb_yannakakis_optimizer.hpp"
+#include "duckdb/optimizer/resultdb_plan_enumerator.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/statistics_propagator.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -26,6 +29,8 @@
 #include "duckdb/planner/resultdb_reduced_plan.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 
 namespace duckdb {
 
@@ -48,6 +53,7 @@ struct ResultDBSemijoinGraphNode {
 	vector<TableIndex> tables;
 	idx_t estimated_cardinality = 0;
 	bool folded = false;
+	bool enumerated_fold = false;
 	idx_t stable_id = DConstants::INVALID_INDEX;
 };
 
@@ -639,7 +645,7 @@ static bool FoldResultDBGraphOnce(const ResultDBSemijoinAnalysis &analysis, Resu
 	return RebuildResultDBGraphEdges(analysis, graph);
 }
 
-static bool BuildResultDBSemijoinGraph(const ResultDBSemijoinAnalysis &analysis, ResultDBSemijoinGraph &graph) {
+static bool BuildResultDBInitialGraph(const ResultDBSemijoinAnalysis &analysis, ResultDBSemijoinGraph &graph) {
 	if (analysis.relations.size() < 2) {
 		graph.unsupported_reason = "semijoin requires at least two joined relation occurrences";
 		return false;
@@ -657,6 +663,16 @@ static bool BuildResultDBSemijoinGraph(const ResultDBSemijoinAnalysis &analysis,
 	if (!RebuildResultDBGraphEdges(analysis, graph)) {
 		return false;
 	}
+	auto adjacency = BuildResultDBGraphAdjacency(graph);
+	if (!ResultDBGraphIsConnected(graph, adjacency)) {
+		graph.unsupported_reason = "semijoin currently supports only connected join graphs";
+		return false;
+	}
+	return true;
+}
+
+static bool FoldResultDBGraphHeuristically(const ResultDBSemijoinAnalysis &analysis,
+	                                       ResultDBSemijoinGraph &graph) {
 
 	while (true) {
 		auto adjacency = BuildResultDBGraphAdjacency(graph);
@@ -675,6 +691,10 @@ static bool BuildResultDBSemijoinGraph(const ResultDBSemijoinAnalysis &analysis,
 			return false;
 		}
 	}
+}
+
+static bool BuildResultDBSemijoinGraph(const ResultDBSemijoinAnalysis &analysis, ResultDBSemijoinGraph &graph) {
+	return BuildResultDBInitialGraph(analysis, graph) && FoldResultDBGraphHeuristically(analysis, graph);
 }
 
 static bool BuildResultDBJoinTree(ResultDBSemijoinGraph &graph, idx_t root_relation,
@@ -874,6 +894,181 @@ CollectResultDBInternalJoinConditions(const ResultDBSemijoinAnalysis &analysis, 
 	return conditions;
 }
 
+class DuckDBResultDBEnumerationCostProvider : public ResultDBEnumerationCostProvider {
+public:
+	DuckDBResultDBEnumerationCostProvider(Binder &binder_p, ClientContext &context_p,
+	                                    ResultDBSemijoinAnalysis &analysis_p,
+	                                    const ResultDBSemijoinGraph &graph_p,
+	                                    const ResultDBProperties &properties_p)
+	    : binder(binder_p), context(context_p), analysis(analysis_p), graph(graph_p), properties(properties_p) {
+	}
+
+	double Cardinality(const vector<idx_t> &nodes) override {
+		vector<idx_t> table_indexes;
+		for (auto node_idx : nodes) {
+			if (node_idx >= graph.nodes.size()) {
+				throw InternalException("ResultDB cost provider received an invalid graph node");
+			}
+			for (auto table : graph.nodes[node_idx].tables) {
+				table_indexes.push_back(table.index);
+			}
+		}
+		std::sort(table_indexes.begin(), table_indexes.end());
+		table_indexes.erase(std::unique(table_indexes.begin(), table_indexes.end()), table_indexes.end());
+		string key;
+		for (auto table_index : table_indexes) {
+			key += std::to_string(table_index) + ",";
+		}
+		auto cached = cardinalities.find(key);
+		if (cached != cardinalities.end()) {
+			return cached->second;
+		}
+		double result = 0;
+		for (auto table_index : table_indexes) {
+			auto relation_entry = analysis.relation_map.find(table_index);
+			if (relation_entry == analysis.relation_map.end()) {
+				throw InternalException("ResultDB cost provider could not map a relation occurrence");
+			}
+			// LogicalOperator::EstimateCardinality is DuckDB's available estimate at
+			// this pre-join-order stage. For a connected fold it uses the maximum
+			// child estimate, matching the estimate attached to the logical join.
+			result = std::max(result, static_cast<double>(analysis.estimated_cardinalities[relation_entry->second]));
+		}
+		if (table_indexes.size() > 1) {
+			auto root_entry = analysis.relation_plans.find(table_indexes[0]);
+			if (root_entry == analysis.relation_plans.end() || !root_entry->second) {
+				throw InternalException("ResultDB cost provider is missing a relation plan");
+			}
+			auto root = root_entry->second->Copy(context);
+			unordered_set<idx_t> visited {table_indexes[0]};
+			while (visited.size() < table_indexes.size()) {
+				bool added = false;
+				for (auto table_index : table_indexes) {
+					if (visited.find(table_index) != visited.end()) {
+						continue;
+					}
+					auto conditions = CollectResultDBInternalJoinConditions(analysis, visited, table_index);
+					if (conditions.empty()) {
+						continue;
+					}
+					auto right_entry = analysis.relation_plans.find(table_index);
+					if (right_entry == analysis.relation_plans.end() || !right_entry->second) {
+						throw InternalException("ResultDB cost provider is missing a relation plan");
+					}
+					root = LogicalComparisonJoin::CreateJoin(JoinType::INNER, JoinRefType::REGULAR, std::move(root),
+					                                         right_entry->second->Copy(context), std::move(conditions));
+					visited.insert(table_index);
+					added = true;
+					break;
+				}
+				if (!added) {
+					throw InternalException("ResultDB cost provider received a disconnected relation subset");
+				}
+			}
+			Optimizer optimizer(binder, context);
+			StatisticsPropagator propagator(optimizer, *root);
+			auto node_statistics = propagator.PropagateStatistics(root);
+			if (node_statistics && node_statistics->has_estimated_cardinality) {
+				result = static_cast<double>(node_statistics->estimated_cardinality);
+			}
+		}
+		cardinalities[key] = result;
+		return result;
+	}
+
+	double PayloadWidth(const vector<idx_t> &nodes) override {
+		unordered_set<idx_t> table_indexes;
+		for (auto node_idx : nodes) {
+			for (auto table : graph.nodes[node_idx].tables) {
+				table_indexes.insert(table.index);
+			}
+		}
+		double width = 0;
+		for (auto &table : properties.tables) {
+			if (table_indexes.find(table.table_index) == table_indexes.end()) {
+				continue;
+			}
+			for (auto &column : table.columns) {
+				width += static_cast<double>(GetTypeIdSize(column.type.InternalType()));
+			}
+		}
+		return std::max(width, 1.0);
+	}
+
+private:
+	Binder &binder;
+	ClientContext &context;
+	ResultDBSemijoinAnalysis &analysis;
+	const ResultDBSemijoinGraph &graph;
+	const ResultDBProperties &properties;
+	unordered_map<string, double> cardinalities;
+};
+
+static ResultDBEnumerationInput BuildResultDBEnumerationInput(const ResultDBSemijoinGraph &graph,
+	                                                          const ResultDBProperties &properties) {
+	ResultDBEnumerationInput result;
+	for (auto &graph_node : graph.nodes) {
+		ResultDBEnumerationNode node;
+		node.stable_id = graph_node.stable_id;
+		node.cardinality = static_cast<double>(graph_node.estimated_cardinality);
+		node.requested = ResultDBNodeContainsOutputTable(graph_node, properties);
+		result.nodes.push_back(node);
+	}
+	for (auto &graph_edge : graph.edges) {
+		result.edges.push_back({graph_edge.left_node, graph_edge.right_node});
+	}
+	return result;
+}
+
+static bool ApplyResultDBFoldPartition(const ResultDBSemijoinAnalysis &analysis, ResultDBSemijoinGraph &graph,
+	                                   const vector<vector<idx_t>> &folds,
+	                                   ResultDBEnumerationCostProvider &costs) {
+	vector<uint8_t> assigned(graph.nodes.size(), 0);
+	vector<vector<idx_t>> partition;
+	for (auto fold : folds) {
+		if (fold.size() < 2) {
+			continue;
+		}
+		if (fold.size() > 20) {
+			graph.unsupported_reason = "exact ResultDB fold join enumeration supports at most 20 relations per fold";
+			return false;
+		}
+		std::sort(fold.begin(), fold.end());
+		for (auto node_idx : fold) {
+			if (node_idx >= graph.nodes.size() || assigned[node_idx]) {
+				graph.unsupported_reason = "TDFold produced overlapping or invalid folds";
+				return false;
+			}
+			assigned[node_idx] = 1;
+		}
+		partition.push_back(std::move(fold));
+	}
+	for (idx_t node_idx = 0; node_idx < graph.nodes.size(); node_idx++) {
+		if (!assigned[node_idx]) {
+			partition.push_back({node_idx});
+		}
+	}
+	std::sort(partition.begin(), partition.end(), [](const auto &left, const auto &right) {
+		return left.front() < right.front();
+	});
+
+	vector<ResultDBSemijoinGraphNode> contracted_nodes;
+	for (auto &group : partition) {
+		ResultDBSemijoinGraphNode node;
+		for (auto node_idx : group) {
+			node.tables.insert(node.tables.end(), graph.nodes[node_idx].tables.begin(), graph.nodes[node_idx].tables.end());
+		}
+		SortResultDBNodeTables(node.tables);
+		node.folded = node.tables.size() > 1;
+		node.enumerated_fold = node.folded;
+		node.stable_id = ResultDBNodeStableId(node);
+		node.estimated_cardinality = static_cast<idx_t>(std::ceil(costs.Cardinality(group)));
+		contracted_nodes.push_back(std::move(node));
+	}
+	graph.nodes = std::move(contracted_nodes);
+	return RebuildResultDBGraphEdges(analysis, graph);
+}
+
 static unique_ptr<LogicalOperator> BuildResultDBFoldJoinPlan(ResultDBSemijoinAnalysis &analysis,
                                                              const ResultDBSemijoinGraphNode &node) {
 	if (node.tables.empty()) {
@@ -881,6 +1076,119 @@ static unique_ptr<LogicalOperator> BuildResultDBFoldJoinPlan(ResultDBSemijoinAna
 	}
 	auto tables = node.tables;
 	SortResultDBNodeTables(tables);
+	if (node.enumerated_fold) {
+		if (tables.size() > 20) {
+			throw InvalidInputException("Exact ResultDB fold join enumeration supports at most 20 relations per fold");
+		}
+		auto full = (uint64_t(1) << tables.size()) - 1;
+		vector<double> cardinality(full + 1, 0);
+		vector<double> cost(full + 1, std::numeric_limits<double>::infinity());
+		vector<uint64_t> split(full + 1, 0);
+		for (idx_t pos = 0; pos < tables.size(); pos++) {
+			auto relation_pos = analysis.relation_map.at(tables[pos].index);
+			cardinality[uint64_t(1) << pos] = analysis.estimated_cardinalities[relation_pos];
+			cost[uint64_t(1) << pos] = 0;
+		}
+		for (uint64_t subset = 1; subset <= full; subset++) {
+			if ((subset & (subset - 1)) == 0) {
+				continue;
+			}
+			for (idx_t pos = 0; pos < tables.size(); pos++) {
+				if ((subset >> pos) & 1) {
+					cardinality[subset] = std::max(cardinality[subset],
+					                               cardinality[uint64_t(1) << pos]);
+				}
+			}
+			for (uint64_t left = (subset - 1) & subset; left; left = (left - 1) & subset) {
+				auto right = subset ^ left;
+				if (!right || left > right || !std::isfinite(cost[left]) || !std::isfinite(cost[right])) {
+					continue;
+				}
+				bool connected = false;
+				for (auto &edge : analysis.edges) {
+					auto left_pos = std::find_if(tables.begin(), tables.end(), [&](TableIndex table) {
+						return table == edge.left_table;
+					});
+					auto right_pos = std::find_if(tables.begin(), tables.end(), [&](TableIndex table) {
+						return table == edge.right_table;
+					});
+					if (left_pos == tables.end() || right_pos == tables.end()) {
+						continue;
+					}
+					auto left_bit = uint64_t(1) << NumericCast<idx_t>(left_pos - tables.begin());
+					auto right_bit = uint64_t(1) << NumericCast<idx_t>(right_pos - tables.begin());
+					if ((subset & left_bit) && (subset & right_bit) &&
+					    static_cast<bool>(left & left_bit) != static_cast<bool>(left & right_bit)) {
+						connected = true;
+						break;
+					}
+				}
+				if (!connected) {
+					continue;
+				}
+				auto candidate = cost[left] + cost[right] + cardinality[subset];
+				if (candidate < cost[subset] || (candidate == cost[subset] && left < split[subset])) {
+					cost[subset] = candidate;
+					split[subset] = left;
+				}
+			}
+		}
+		if (!std::isfinite(cost[full])) {
+			throw InternalException("ResultDB exact fold join enumeration found no connected plan");
+		}
+		std::function<unique_ptr<LogicalOperator>(uint64_t)> build = [&](uint64_t subset) {
+			if ((subset & (subset - 1)) == 0) {
+				idx_t pos = 0;
+				while (((subset >> pos) & 1) == 0) {
+					pos++;
+				}
+				return TakeResultDBRelationPlan(analysis, tables[pos].index);
+			}
+			auto left_mask = split[subset];
+			auto right_mask = subset ^ left_mask;
+			unordered_set<idx_t> left_tables;
+			for (idx_t pos = 0; pos < tables.size(); pos++) {
+				if ((left_mask >> pos) & 1) {
+					left_tables.insert(tables[pos].index);
+				}
+			}
+			vector<JoinCondition> conditions;
+			for (auto &edge : analysis.edges) {
+				auto edge_left_pos = std::find_if(tables.begin(), tables.end(), [&](TableIndex table) {
+					return table == edge.left_table;
+				});
+				auto edge_right_pos = std::find_if(tables.begin(), tables.end(), [&](TableIndex table) {
+					return table == edge.right_table;
+				});
+				if (edge_left_pos == tables.end() || edge_right_pos == tables.end()) {
+					continue;
+				}
+				auto edge_left_bit = uint64_t(1) << NumericCast<idx_t>(edge_left_pos - tables.begin());
+				auto edge_right_bit = uint64_t(1) << NumericCast<idx_t>(edge_right_pos - tables.begin());
+				if (!(subset & edge_left_bit) || !(subset & edge_right_bit)) {
+					continue;
+				}
+				bool edge_left_in_left = left_tables.find(edge.left_table.index) != left_tables.end();
+				bool edge_right_in_left = left_tables.find(edge.right_table.index) != left_tables.end();
+				if (edge_left_in_left == edge_right_in_left) {
+					continue;
+				}
+				for (auto &condition : edge.conditions) {
+					auto copied = condition.Copy();
+					if (!edge_left_in_left) {
+						copied.Swap();
+					}
+					conditions.push_back(std::move(copied));
+				}
+			}
+			if (conditions.empty()) {
+				throw InternalException("ResultDB exact fold join split has no join condition");
+			}
+			return LogicalComparisonJoin::CreateJoin(JoinType::INNER, JoinRefType::REGULAR, build(left_mask),
+			                                         build(right_mask), std::move(conditions));
+		};
+		return build(full);
+	}
 	auto root_table = tables[0].index;
 	auto root = TakeResultDBRelationPlan(analysis, root_table);
 	unordered_set<idx_t> visited_tables;
@@ -934,6 +1242,7 @@ static unique_ptr<LogicalOperator> BuildResultDBNodeMaterializationPlan(Binder &
 	}
 
 	auto base_plan = BuildResultDBFoldJoinPlan(analysis, node);
+	relation.preserve_join_order = node.enumerated_fold;
 	auto projection_index = binder.GenerateTableIndex();
 	auto projection = make_uniq<LogicalProjection>(projection_index, std::move(projection_expressions));
 	projection->AddChild(std::move(base_plan));
@@ -950,13 +1259,17 @@ static unique_ptr<LogicalOperator> BuildResultDBNodeMaterializationPlan(Binder &
 static unique_ptr<ResultDBYannakakisProgram>
 BuildResultDBYannakakisProgram(Binder &binder, ResultDBSemijoinAnalysis &analysis, ResultDBSemijoinGraph &graph,
                                idx_t root_relation,
-                               vector<idx_t> parent, vector<idx_t> parent_edge, vector<idx_t> order) {
+	                           vector<idx_t> parent, vector<idx_t> parent_edge, vector<idx_t> order,
+	                           vector<vector<idx_t>> bottom_up_children = {},
+	                           vector<vector<idx_t>> top_down_children = {}) {
 	auto &properties = binder.GetStatementProperties();
 	auto program = make_uniq<ResultDBYannakakisProgram>();
 	program->root_relation = root_relation;
 	program->parent = std::move(parent);
 	program->parent_edge = std::move(parent_edge);
 	program->order = std::move(order);
+	program->bottom_up_children = std::move(bottom_up_children);
+	program->top_down_children = std::move(top_down_children);
 	program->relations.resize(graph.nodes.size());
 
 	vector<vector<ResultDBYannakakisSourceColumn>> needed_columns(graph.nodes.size());
@@ -1146,6 +1459,44 @@ ResultDBYannakakisOptimizer::ResultDBYannakakisOptimizer(Binder &binder, ClientC
     : binder(binder), context(context) {
 }
 
+static void ResetResultDBPlanningDiagnostics(ResultDBProperties &properties) {
+	properties.selected_root_table_index = DConstants::INVALID_INDEX;
+	properties.selected_folds.clear();
+	properties.estimated_semijoin_cost = 0;
+	properties.estimated_decompose_cost = 0;
+	properties.enumeration_time_ms = 0;
+	properties.fold_candidate_count = 0;
+	properties.block_sizes.clear();
+	properties.tvc_enabled = false;
+	properties.planning_reason.clear();
+}
+
+static void StoreResultDBSelectedGraph(ResultDBProperties &properties, const ResultDBSemijoinGraph &graph,
+	                                   idx_t root_relation) {
+	if (root_relation < graph.nodes.size()) {
+		properties.selected_root_table_index = graph.nodes[root_relation].stable_id;
+	}
+	properties.selected_folds.clear();
+	for (auto &node : graph.nodes) {
+		if (node.tables.size() < 2) {
+			continue;
+		}
+		vector<idx_t> fold;
+		for (auto table : node.tables) {
+			fold.push_back(table.index);
+		}
+		properties.selected_folds.push_back(std::move(fold));
+	}
+}
+
+static vector<idx_t> AllResultDBEnumerationNodes(const ResultDBEnumerationInput &input) {
+	vector<idx_t> result;
+	for (idx_t node_idx = 0; node_idx < input.nodes.size(); node_idx++) {
+		result.push_back(node_idx);
+	}
+	return result;
+}
+
 unique_ptr<LogicalOperator>
 ResultDBYannakakisOptimizer::Optimize(unique_ptr<LogicalOperator> plan,
                                       unique_ptr<ResultDBYannakakisProgram> &resultdb_yannakakis_program) {
@@ -1154,15 +1505,22 @@ ResultDBYannakakisOptimizer::Optimize(unique_ptr<LogicalOperator> plan,
 	if (!properties.resultdb.enabled) {
 		return plan;
 	}
-	properties.resultdb.execution_strategy = ResultDBStrategy::DECOMPOSE;
+	properties.resultdb.execution_strategy = ResultDBExecutionStrategy::DECOMPOSE;
 	properties.resultdb.join_edges.clear();
+	ResetResultDBPlanningDiagnostics(properties.resultdb);
 	if (properties.resultdb.requested_strategy == ResultDBStrategy::DECOMPOSE) {
+		properties.resultdb.planning_reason = "explicit decompose strategy";
 		return plan;
 	}
 
 	if (plan->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+		if (properties.resultdb.requested_strategy == ResultDBStrategy::AUTO) {
+			properties.resultdb.planning_reason = "TDResultDB selected decompose for a statically empty query";
+			return plan;
+		}
 		resultdb_yannakakis_program = BuildResultDBEmptyYannakakisProgram(binder);
-		properties.resultdb.execution_strategy = ResultDBStrategy::SEMIJOIN;
+		properties.resultdb.execution_strategy = ResultDBExecutionStrategy::SEMIJOIN;
+		properties.resultdb.planning_reason = "explicit direct strategy for a statically empty query";
 		return make_uniq_base<LogicalOperator, LogicalDummyScan>(binder.GenerateTableIndex());
 	}
 
@@ -1175,31 +1533,122 @@ ResultDBYannakakisOptimizer::Optimize(unique_ptr<LogicalOperator> plan,
 		                      analysis.unsupported_reason);
 	}
 	CanonicalizeResultDBJoinConditions(analysis);
+	StoreResultDBJoinMetadata(properties.resultdb, analysis);
 
 	vector<idx_t> parent;
 	vector<idx_t> parent_edge;
 	vector<idx_t> order;
 	idx_t root_relation = DConstants::INVALID_INDEX;
 	ResultDBSemijoinGraph graph;
-	if (!BuildResultDBSemijoinGraph(analysis, graph)) {
+	auto planning_start = std::chrono::steady_clock::now();
+	auto requested_strategy = properties.resultdb.requested_strategy;
+	bool use_heuristic_folds = requested_strategy == ResultDBStrategy::SEMIJOIN ||
+	                           requested_strategy == ResultDBStrategy::TDROOT;
+	bool graph_valid = use_heuristic_folds ? BuildResultDBSemijoinGraph(analysis, graph)
+	                                     : BuildResultDBInitialGraph(analysis, graph);
+	if (!graph_valid) {
 		if (properties.resultdb.requested_strategy == ResultDBStrategy::AUTO) {
-			return plan;
-		}
-		throw BinderException("RESULTDB semijoin strategy does not support this query: %s",
-		                      graph.unsupported_reason);
-	}
-	if (!ChooseResultDBRootRelation(graph, properties.resultdb, parent, parent_edge, order, root_relation)) {
-		if (properties.resultdb.requested_strategy == ResultDBStrategy::AUTO) {
+			properties.resultdb.planning_reason = graph.unsupported_reason;
 			return plan;
 		}
 		throw BinderException("RESULTDB semijoin strategy does not support this query: %s",
 		                      graph.unsupported_reason);
 	}
 
+	vector<vector<idx_t>> bottom_up_children;
+	vector<vector<idx_t>> top_down_children;
+	if (requested_strategy == ResultDBStrategy::SEMIJOIN) {
+		if (!ChooseResultDBRootRelation(graph, properties.resultdb, parent, parent_edge, order, root_relation)) {
+			throw BinderException("RESULTDB semijoin strategy does not support this query: %s",
+			                      graph.unsupported_reason);
+		}
+		properties.resultdb.planning_reason = "existing degree/cardinality heuristic";
+	} else if (requested_strategy == ResultDBStrategy::TDROOT) {
+		DuckDBResultDBEnumerationCostProvider cost_provider(binder, context, analysis, graph, properties.resultdb);
+		auto input = BuildResultDBEnumerationInput(graph, properties.resultdb);
+		auto root_plan = ResultDBPlanEnumerator::EnumerateRoot(input, cost_provider);
+		if (!root_plan.valid) {
+			throw BinderException("RESULTDB TDRoot strategy does not support this query: %s", root_plan.error);
+		}
+		root_relation = root_plan.root;
+		parent = std::move(root_plan.parent);
+		parent_edge = std::move(root_plan.parent_edge);
+		order = std::move(root_plan.order);
+		bottom_up_children = std::move(root_plan.bottom_up_children);
+		top_down_children = std::move(root_plan.top_down_children);
+		properties.resultdb.estimated_semijoin_cost = root_plan.cost;
+		properties.resultdb.planning_reason = "TDRoot over the heuristic fold tree";
+	} else {
+		DuckDBResultDBEnumerationCostProvider cost_provider(binder, context, analysis, graph, properties.resultdb);
+		auto input = BuildResultDBEnumerationInput(graph, properties.resultdb);
+		auto all_nodes = AllResultDBEnumerationNodes(input);
+		auto join_cost = ResultDBPlanEnumerator::EstimateJoinCost(input, cost_provider, all_nodes);
+		properties.resultdb.estimated_decompose_cost =
+		    join_cost + cost_provider.Cardinality(all_nodes) * cost_provider.PayloadWidth(all_nodes);
+		bool use_tvc = requested_strategy != ResultDBStrategy::TDFOLD_NO_TVC;
+		properties.resultdb.tvc_enabled = use_tvc;
+		ResultDBFoldEnumerationResult fold_plan;
+		try {
+			fold_plan = ResultDBPlanEnumerator::EnumerateFolds(input, cost_provider, use_tvc);
+		} catch (Exception &ex) {
+			if (requested_strategy == ResultDBStrategy::AUTO) {
+				properties.resultdb.planning_reason = StringUtil::Format("TDResultDB selected decompose: %s", ex.what());
+				return plan;
+			}
+			throw;
+		}
+		properties.resultdb.fold_candidate_count = fold_plan.candidate_count;
+		properties.resultdb.block_sizes = fold_plan.block_sizes;
+		properties.resultdb.estimated_semijoin_cost = fold_plan.cost;
+		if (!fold_plan.valid) {
+			if (requested_strategy == ResultDBStrategy::AUTO) {
+				properties.resultdb.planning_reason = "TDResultDB selected decompose because TDFold found no plan";
+				return plan;
+			}
+			throw BinderException("RESULTDB TDFold strategy does not support this query: %s", fold_plan.error);
+		}
+		if (requested_strategy == ResultDBStrategy::AUTO &&
+		    properties.resultdb.estimated_decompose_cost <= properties.resultdb.estimated_semijoin_cost) {
+			properties.resultdb.planning_reason = "TDResultDB cost comparison selected decompose";
+			auto planning_end = std::chrono::steady_clock::now();
+			properties.resultdb.enumeration_time_ms =
+			    std::chrono::duration<double, std::milli>(planning_end - planning_start).count();
+			return plan;
+		}
+		if (!ApplyResultDBFoldPartition(analysis, graph, fold_plan.folds, cost_provider)) {
+			if (requested_strategy == ResultDBStrategy::AUTO) {
+				properties.resultdb.planning_reason = graph.unsupported_reason;
+				return plan;
+			}
+			throw BinderException("RESULTDB TDFold produced an invalid plan: %s", graph.unsupported_reason);
+		}
+		DuckDBResultDBEnumerationCostProvider contracted_cost_provider(binder, context, analysis, graph,
+		                                                             properties.resultdb);
+		auto contracted_input = BuildResultDBEnumerationInput(graph, properties.resultdb);
+		auto root_plan = ResultDBPlanEnumerator::EnumerateRoot(contracted_input, contracted_cost_provider);
+		if (!root_plan.valid) {
+			throw BinderException("RESULTDB TDFold produced an invalid contracted tree: %s", root_plan.error);
+		}
+		root_relation = root_plan.root;
+		parent = std::move(root_plan.parent);
+		parent_edge = std::move(root_plan.parent_edge);
+		order = std::move(root_plan.order);
+		bottom_up_children = std::move(root_plan.bottom_up_children);
+		top_down_children = std::move(root_plan.top_down_children);
+		properties.resultdb.planning_reason = requested_strategy == ResultDBStrategy::AUTO
+		                                          ? "TDResultDB cost comparison selected TDFold+TDRoot"
+		                                          : (use_tvc ? "TDFold with TVCs followed by TDRoot"
+		                                                     : "TDFold without TVCs followed by TDRoot");
+	}
+
 	resultdb_yannakakis_program = BuildResultDBYannakakisProgram(
-	    binder, analysis, graph, root_relation, std::move(parent), std::move(parent_edge), std::move(order));
-	properties.resultdb.execution_strategy = ResultDBStrategy::SEMIJOIN;
-	StoreResultDBJoinMetadata(properties.resultdb, analysis);
+	    binder, analysis, graph, root_relation, std::move(parent), std::move(parent_edge), std::move(order),
+	    std::move(bottom_up_children), std::move(top_down_children));
+	properties.resultdb.execution_strategy = ResultDBExecutionStrategy::SEMIJOIN;
+	StoreResultDBSelectedGraph(properties.resultdb, graph, root_relation);
+	auto planning_end = std::chrono::steady_clock::now();
+	properties.resultdb.enumeration_time_ms =
+	    std::chrono::duration<double, std::milli>(planning_end - planning_start).count();
 	return make_uniq_base<LogicalOperator, LogicalDummyScan>(binder.GenerateTableIndex());
 }
 

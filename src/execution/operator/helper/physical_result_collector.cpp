@@ -29,10 +29,12 @@ unique_ptr<PhysicalOperator> PhysicalResultCollector::GetResultCollector(ClientC
 	auto &physical_plan = *data.physical_plan;
 	auto &root = physical_plan.Root();
 
-	if (data.properties.resultdb.enabled && data.properties.resultdb.execution_strategy == ResultDBStrategy::SEMIJOIN) {
+	if (data.properties.resultdb.enabled &&
+	    data.properties.resultdb.execution_strategy == ResultDBExecutionStrategy::SEMIJOIN) {
 		return make_uniq<PhysicalResultDBDirectCollector>(physical_plan, data);
 	}
-	if (data.properties.resultdb.enabled && data.properties.resultdb.execution_strategy == ResultDBStrategy::DECOMPOSE) {
+	if (data.properties.resultdb.enabled &&
+	    data.properties.resultdb.execution_strategy == ResultDBExecutionStrategy::DECOMPOSE) {
 		return make_uniq<PhysicalResultDBDecomposeCollector>(physical_plan, data);
 	}
 

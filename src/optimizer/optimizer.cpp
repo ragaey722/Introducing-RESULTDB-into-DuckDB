@@ -250,10 +250,12 @@ void Optimizer::RunBuiltInOptimizers() {
 
 	// then we perform the join ordering optimization
 	// this also rewrites cross products + filters into joins and performs filter pushdowns
-	RunOptimizer(OptimizerType::JOIN_ORDER, [&]() {
-		JoinOrderOptimizer optimizer(context);
-		plan = optimizer.Optimize(std::move(plan));
-	});
+	if (!skip_join_order) {
+		RunOptimizer(OptimizerType::JOIN_ORDER, [&]() {
+			JoinOrderOptimizer optimizer(context);
+			plan = optimizer.Optimize(std::move(plan));
+		});
+	}
 
 	RunOptimizer(OptimizerType::JOIN_ELIMINATION, [&]() {
 		JoinElimination join_elimination;

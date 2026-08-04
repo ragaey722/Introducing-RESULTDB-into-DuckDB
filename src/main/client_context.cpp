@@ -625,24 +625,63 @@ void PreparedResultDBYannakakisProgram::BuildReductionSchedule() {
 	}
 
 	bottom_up_steps.reserve(relations.size() - 1);
-	for (idx_t order_offset = order.size(); order_offset > 0; order_offset--) {
-		auto child = order[order_offset - 1];
-		if (child == root_relation) {
-			continue;
+	if (bottom_up_children.size() == relations.size()) {
+		vector<uint8_t> scheduled_child(relations.size(), 0);
+		for (idx_t relation_idx = 0; relation_idx < relations.size(); relation_idx++) {
+			for (auto child : bottom_up_children[relation_idx]) {
+				if (child >= relations.size() || parent[child] != relation_idx || scheduled_child[child]) {
+					throw InternalException("ResultDB Yannakakis bottom-up sibling order is invalid");
+				}
+				scheduled_child[child] = 1;
+			}
 		}
-		bottom_up_steps.push_back(
-		    BuildPreparedResultDBReductionStep(*this, parent[child], child, parent_edge[child]));
+		for (idx_t relation_idx = 0; relation_idx < relations.size(); relation_idx++) {
+			if (relation_idx != root_relation && !scheduled_child[relation_idx]) {
+				throw InternalException("ResultDB Yannakakis bottom-up sibling order is incomplete");
+			}
+		}
+		std::function<void(idx_t)> append_bottom_up = [&](idx_t relation_idx) {
+			for (auto child : bottom_up_children[relation_idx]) {
+				append_bottom_up(child);
+				bottom_up_steps.push_back(
+				    BuildPreparedResultDBReductionStep(*this, relation_idx, child, parent_edge[child]));
+			}
+		};
+		append_bottom_up(root_relation);
+	} else {
+		// Preserve the original heuristic schedule exactly for the semijoin baseline.
+		for (idx_t order_offset = order.size(); order_offset > 0; order_offset--) {
+			auto child = order[order_offset - 1];
+			if (child != root_relation) {
+				bottom_up_steps.push_back(
+				    BuildPreparedResultDBReductionStep(*this, parent[child], child, parent_edge[child]));
+			}
+		}
 	}
 
-	top_down_steps.reserve(relations.size() - 1);
-	for (idx_t order_idx = 1; order_idx < order.size(); order_idx++) {
-		auto child = order[order_idx];
-		if (!required_for_output[child]) {
-			continue;
+	vector<vector<idx_t>> scheduled_top_down_children(relations.size());
+	if (top_down_children.size() == relations.size()) {
+		scheduled_top_down_children = top_down_children;
+	} else {
+		for (idx_t order_idx = 1; order_idx < order.size(); order_idx++) {
+			auto child = order[order_idx];
+			if (required_for_output[child]) {
+				scheduled_top_down_children[parent[child]].push_back(child);
+			}
 		}
-		top_down_steps.push_back(
-		    BuildPreparedResultDBReductionStep(*this, child, parent[child], parent_edge[child]));
 	}
+	top_down_steps.reserve(relations.size() - 1);
+	std::function<void(idx_t)> append_top_down = [&](idx_t relation_idx) {
+		for (auto child : scheduled_top_down_children[relation_idx]) {
+			if (child >= relations.size() || parent[child] != relation_idx || !required_for_output[child]) {
+				throw InternalException("ResultDB Yannakakis top-down sibling order is invalid");
+			}
+			top_down_steps.push_back(
+			    BuildPreparedResultDBReductionStep(*this, child, relation_idx, parent_edge[child]));
+			append_top_down(child);
+		}
+	};
+	append_top_down(root_relation);
 
 	for (idx_t step_idx = 0; step_idx < bottom_up_steps.size(); step_idx++) {
 		auto &step = bottom_up_steps[step_idx];
@@ -708,12 +747,14 @@ void PreparedResultDBYannakakisProgram::BuildReductionSchedule() {
 }
 
 static unique_ptr<PhysicalPlan> PlanResultDBYannakakisPhase(ClientContext &context, Binder &binder,
-                                                           unique_ptr<LogicalOperator> logical_plan, bool optimize) {
+	                                                       unique_ptr<LogicalOperator> logical_plan, bool optimize,
+	                                                       bool preserve_join_order) {
 	// Each materialization phase is still planned through DuckDB's normal optimizer/physical planner.
 	if (optimize && logical_plan->RequireOptimizer()) {
 		auto resultdb_properties = binder.GetStatementProperties().resultdb;
 		binder.GetStatementProperties().resultdb.enabled = false;
 		Optimizer optimizer(binder, context);
+		optimizer.skip_join_order = preserve_join_order;
 		try {
 			logical_plan = optimizer.Optimize(std::move(logical_plan));
 		} catch (...) {
@@ -749,6 +790,8 @@ PrepareResultDBYannakakisProgram(ClientContext &context, Binder &binder, ResultD
 	prepared->parent = std::move(parent);
 	prepared->parent_edge = std::move(parent_edge);
 	prepared->order = std::move(order);
+	prepared->bottom_up_children = std::move(program.bottom_up_children);
+	prepared->top_down_children = std::move(program.top_down_children);
 	prepared->edges = std::move(program.edges);
 	prepared->outputs = std::move(program.outputs);
 
@@ -756,7 +799,8 @@ PrepareResultDBYannakakisProgram(ClientContext &context, Binder &binder, ResultD
 	prepared->base_plans.reserve(program.relations.size());
 	for (auto &relation : program.relations) {
 		prepared->base_plans.push_back(
-		    PlanResultDBYannakakisPhase(context, binder, std::move(relation.base_plan), optimize));
+		    PlanResultDBYannakakisPhase(context, binder, std::move(relation.base_plan), optimize,
+		                                   relation.preserve_join_order));
 		prepared->relations.push_back(std::move(relation));
 	}
 	prepared->BuildReductionSchedule();

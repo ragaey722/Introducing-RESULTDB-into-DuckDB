@@ -14,11 +14,20 @@ ResultDBStrategy ResultDBStrategyFromString(const string &strategy) {
 	if (normalized == "semijoin") {
 		return ResultDBStrategy::SEMIJOIN;
 	}
-	if (normalized == "auto") {
+	if (normalized == "tdroot") {
+		return ResultDBStrategy::TDROOT;
+	}
+	if (normalized == "tdfold_no_tvc" || normalized == "tdfold-no-tvc") {
+		return ResultDBStrategy::TDFOLD_NO_TVC;
+	}
+	if (normalized == "tdfold") {
+		return ResultDBStrategy::TDFOLD;
+	}
+	if (normalized == "auto" || normalized == "tdresultdb") {
 		return ResultDBStrategy::AUTO;
 	}
-	throw InvalidInputException("Unrecognized resultdb_strategy \"%s\". Expected decompose, semijoin, or auto",
-	                            strategy);
+	throw InvalidInputException("Unrecognized resultdb_strategy \"%s\". Expected decompose, semijoin, tdroot, "
+	                            "tdfold_no_tvc, tdfold, auto, or tdresultdb", strategy);
 }
 
 string ResultDBStrategyToString(ResultDBStrategy strategy) {
@@ -27,6 +36,12 @@ string ResultDBStrategyToString(ResultDBStrategy strategy) {
 		return "decompose";
 	case ResultDBStrategy::SEMIJOIN:
 		return "semijoin";
+	case ResultDBStrategy::TDROOT:
+		return "tdroot";
+	case ResultDBStrategy::TDFOLD_NO_TVC:
+		return "tdfold_no_tvc";
+	case ResultDBStrategy::TDFOLD:
+		return "tdfold";
 	case ResultDBStrategy::AUTO:
 		return "auto";
 	}

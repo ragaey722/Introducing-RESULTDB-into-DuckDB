@@ -36,6 +36,8 @@ public:
 	Binder &binder;
 	ExpressionRewriter rewriter;
 	unique_ptr<ResultDBYannakakisProgram> resultdb_yannakakis_program;
+	//! Internal ResultDB phase planning can provide an already enumerated fold tree.
+	bool skip_join_order = false;
 
 private:
 	void RunBuiltInOptimizers();

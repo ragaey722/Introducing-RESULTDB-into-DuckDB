@@ -67,7 +67,12 @@ string StatementReturnTypeToString(StatementReturnType type);
 class Catalog;
 class ClientContext;
 
-enum class ResultDBStrategy : uint8_t { DECOMPOSE, SEMIJOIN, AUTO };
+//! User-visible ResultDB planning variants. AUTO is the paper's TDResultDB
+//! comparison between an optimized semijoin plan and decompose.
+enum class ResultDBStrategy : uint8_t { DECOMPOSE, SEMIJOIN, TDROOT, TDFOLD_NO_TVC, TDFOLD, AUTO };
+
+//! Physical ResultDB representation selected by planning.
+enum class ResultDBExecutionStrategy : uint8_t { DECOMPOSE, SEMIJOIN };
 
 DUCKDB_API ResultDBStrategy ResultDBStrategyFromString(const string &strategy);
 DUCKDB_API string ResultDBStrategyToString(ResultDBStrategy strategy);
@@ -108,8 +113,18 @@ struct ResultDBProperties {
 	bool enabled = false;
 	//! Strategy requested through SET resultdb_strategy.
 	ResultDBStrategy requested_strategy = ResultDBStrategy::DECOMPOSE;
-	//! Strategy chosen by planning. AUTO can resolve to either SEMIJOIN or DECOMPOSE.
-	ResultDBStrategy execution_strategy = ResultDBStrategy::DECOMPOSE;
+	//! Physical strategy chosen by planning.
+	ResultDBExecutionStrategy execution_strategy = ResultDBExecutionStrategy::DECOMPOSE;
+	//! TDRoot/TDFold diagnostics retained for tests and thesis tooling.
+	idx_t selected_root_table_index = DConstants::INVALID_INDEX;
+	vector<vector<idx_t>> selected_folds;
+	double estimated_semijoin_cost = 0;
+	double estimated_decompose_cost = 0;
+	double enumeration_time_ms = 0;
+	idx_t fold_candidate_count = 0;
+	vector<idx_t> block_sizes;
+	bool tvc_enabled = false;
+	string planning_reason;
 	//! Tables to return after decomposing the flat SELECT result, in output order.
 	vector<ResultDBTableMetadata> tables;
 	//! Equality join graph used by the semijoin strategy.

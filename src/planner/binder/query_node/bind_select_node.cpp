@@ -777,7 +777,7 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 		properties.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
 		properties.resultdb.enabled = true;
 		properties.resultdb.requested_strategy = ResultDBStrategyFromString(Settings::Get<ResultdbStrategySetting>(context));
-		properties.resultdb.execution_strategy = properties.resultdb.requested_strategy;
+		properties.resultdb.execution_strategy = ResultDBExecutionStrategy::DECOMPOSE;
 		properties.resultdb.join_edges.clear();
 		properties.resultdb.tables = BuildResultDBTables(resultdb_columns, result.names, result.types);
 	}
