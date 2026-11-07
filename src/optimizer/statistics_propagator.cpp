@@ -1,4 +1,6 @@
 #include "duckdb/optimizer/statistics_propagator.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
+#include "duckdb/main/client_config.hpp"
 
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
@@ -84,6 +86,18 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalOper
 		break;
 	default:
 		result = PropagateChildren(node, node_ptr);
+	}
+
+	auto oracle = ClientConfig::GetConfig(context).native_oracle_active;
+	if (oracle && node_ptr->type != LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+		auto found = oracle->pinned.find(&node);
+		if (found != oracle->pinned.end()) {
+			node_ptr->SetEstimatedCardinality(found->second);
+			if (result) {
+				result->estimated_cardinality = found->second;
+				result->has_estimated_cardinality = true;
+			}
+		}
 	}
 
 	if (!optimizer.OptimizerDisabled(OptimizerType::COMPRESSED_MATERIALIZATION)) {

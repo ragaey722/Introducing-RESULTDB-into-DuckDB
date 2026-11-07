@@ -1,4 +1,6 @@
 #include "duckdb/optimizer/join_order/query_graph_manager.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
+#include "duckdb/main/client_config.hpp"
 
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/enums/join_type.hpp"
@@ -445,6 +447,15 @@ GenerateJoinRelation QueryGraphManager::GenerateJoins(vector<unique_ptr<LogicalO
 				}
 			}
 		}
+	}
+	auto oracle = ClientConfig::GetConfig(context).native_oracle_active;
+	if (oracle) {
+		// A FILTER above a join has a different row count from its input.
+		std::function<void(LogicalOperator &)> pin = [&](LogicalOperator &op) {
+			for (auto &child : op.children) { pin(*child); }
+			oracle->Pin(op);
+		};
+		pin(*result_operator);
 	}
 	auto result = GenerateJoinRelation(result_relation, std::move(result_operator));
 	return result;

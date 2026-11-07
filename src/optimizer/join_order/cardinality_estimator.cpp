@@ -1,4 +1,5 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/printer.hpp"
@@ -415,6 +416,9 @@ DenomInfo CardinalityEstimator::GetDenominator(JoinRelationSet &set) {
 // based on stats (see CalculateUpdatedDenom()).
 template <>
 double CardinalityEstimator::EstimateCardinalityWithSet(JoinRelationSet &new_set) {
+	if (native_oracle && !native_oracle->oracle.discovery) {
+		return double(native_oracle->Cardinality(new_set, 0));
+	}
 	double result;
 	auto it = relation_set_2_cardinality.find(new_set.ToString());
 	if (it != relation_set_2_cardinality.end()) {
@@ -428,7 +432,8 @@ double CardinalityEstimator::EstimateCardinalityWithSet(JoinRelationSet &new_set
 		result = numerator / denom.denominator;
 		relation_set_2_cardinality[new_set.ToString()] = CardinalityHelper(result);
 	}
-	return ApplyOrFilterSelectivities(new_set, result);
+	auto filtered = ApplyOrFilterSelectivities(new_set, result);
+	return native_oracle ? double(native_oracle->Cardinality(new_set, idx_t(filtered))) : filtered;
 }
 
 double CardinalityEstimator::ApplyOrFilterSelectivities(JoinRelationSet &new_set, double cardinality) const {

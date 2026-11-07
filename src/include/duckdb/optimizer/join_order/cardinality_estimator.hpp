@@ -15,6 +15,7 @@
 namespace duckdb {
 
 class FilterInfo;
+class NativeRowOracleGraph;
 
 struct DenomInfo {
 	DenomInfo(JoinRelationSet &numerator_relations, double filter_strength, double denominator)
@@ -89,6 +90,7 @@ public:
 
 class CardinalityEstimator {
 public:
+	shared_ptr<NativeRowOracleGraph> native_oracle;
 	static constexpr double DEFAULT_SEMI_ANTI_SELECTIVITY = 5;
 	explicit CardinalityEstimator() {};
 

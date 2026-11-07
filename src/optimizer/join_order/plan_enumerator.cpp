@@ -1,4 +1,5 @@
 #include "duckdb/optimizer/join_order/plan_enumerator.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
 
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
@@ -457,6 +458,9 @@ void PlanEnumerator::InitLeafPlans() {
 	for (idx_t i = 0; i < relation_stats.size(); i++) {
 		auto stats = relation_stats.at(i);
 		auto &relation_set = query_graph_manager.set_manager.GetJoinRelation(RelationIndex(i));
+		if (cost_model.cardinality_estimator.native_oracle) {
+			stats.cardinality = cost_model.cardinality_estimator.native_oracle->Cardinality(relation_set, stats.cardinality);
+		}
 		auto join_node = make_uniq<DPJoinNode>(relation_set);
 		join_node->cost = 0;
 		join_node->cardinality = stats.cardinality;

@@ -1,4 +1,6 @@
 #include "duckdb/optimizer/join_order/join_node.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/optimizer/join_order/join_order_optimizer.hpp"
 #include "duckdb/optimizer/join_order/cost_model.hpp"
 
@@ -6,6 +8,10 @@ namespace duckdb {
 
 CostModel::CostModel(QueryGraphManager &query_graph_manager)
     : query_graph_manager(query_graph_manager), cardinality_estimator() {
+	auto oracle = ClientConfig::GetConfig(query_graph_manager.context).native_oracle_active;
+	if (oracle) {
+		cardinality_estimator.native_oracle = oracle->BindGraph(query_graph_manager);
+	}
 }
 
 // Currently cost of a join only factors in the cardinalities.

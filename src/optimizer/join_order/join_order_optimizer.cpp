@@ -1,4 +1,6 @@
 #include "duckdb/optimizer/join_order/join_order_optimizer.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
+#include "duckdb/main/client_config.hpp"
 
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/limits.hpp"
@@ -65,6 +67,11 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 			new_logical_plan->estimated_cardinality = relation_stats.at(0).cardinality;
 			new_logical_plan->has_estimated_cardinality = true;
 		}
+	}
+
+	auto oracle = ClientConfig::GetConfig(context).native_oracle_active;
+	if (oracle && new_logical_plan->type != LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+		oracle->Pin(*new_logical_plan);
 	}
 
 	// Propagate up a stats object from the top of the new_logical_plan if stats exist.

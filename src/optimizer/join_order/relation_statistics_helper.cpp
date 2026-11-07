@@ -1,4 +1,6 @@
 #include "duckdb/optimizer/join_order/relation_statistics_helper.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -117,6 +119,11 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 		}
 	}
 
+	auto oracle = ClientConfig::GetConfig(context).native_oracle_active;
+	if (oracle) {
+		base_table_cardinality = oracle->Raw(get, base_table_cardinality);
+		cardinality_after_filters = base_table_cardinality;
+	}
 	if (get.table_filters.HasFilters()) {
 		unique_ptr<BaseStatistics> column_statistics;
 		bool has_non_optional_filters = false;
@@ -154,6 +161,12 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 		if (base_table_cardinality == 0) {
 			cardinality_after_filters = 0;
 		}
+	}
+	if (oracle) {
+		cardinality_after_filters = oracle->Lookup(oracle->Describe(get), cardinality_after_filters, "filtered_scan");
+		// Singleton regions may bypass join reconstruction. Retain their exact
+		// filtered estimate in NodeStatistics as well, without changing its maximum.
+		oracle->pinned[&get] = cardinality_after_filters;
 	}
 	return_stats.cardinality = cardinality_after_filters;
 	// update the estimated cardinality of the get as well.
