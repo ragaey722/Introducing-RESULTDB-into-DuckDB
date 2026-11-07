@@ -24,7 +24,7 @@
 #include "duckdb/optimizer/regex_range_filter.hpp"
 #include "duckdb/optimizer/remove_duplicate_groups.hpp"
 #include "duckdb/optimizer/remove_unused_columns.hpp"
-#include "duckdb/optimizer/resultdb_yannakakis_optimizer.hpp"
+#include "duckdb/optimizer/resultdb_optimizer.hpp"
 #include "duckdb/optimizer/row_group_pruner.hpp"
 #include "duckdb/optimizer/rule/distinct_aggregate_optimizer.hpp"
 #include "duckdb/optimizer/rule/equal_or_null_simplification.hpp"
@@ -160,6 +160,10 @@ void Optimizer::RunBuiltInOptimizers() {
 	default:
 		break;
 	}
+	// One ResultDB optimizer owns both phases. Capture topology now, but allow
+	// whole-query expression/filter optimization before constructing execution.
+	ResultDBOptimizer resultdb_optimizer(binder, context);
+	resultdb_optimizer.CaptureGraph(*plan);
 	// first we perform expression rewrites using the ExpressionRewriter
 	// this does not change the logical plan structure, but only simplifies the expression trees
 	RunOptimizer(OptimizerType::EXPRESSION_REWRITER, [&]() { rewriter.VisitOperator(*plan); });
@@ -201,8 +205,7 @@ void Optimizer::RunBuiltInOptimizers() {
 		plan = regex_opt.Rewrite(std::move(plan));
 	});
 
-	ResultDBYannakakisOptimizer resultdb_yannakakis_optimizer(binder, context);
-	plan = resultdb_yannakakis_optimizer.Optimize(std::move(plan), resultdb_yannakakis_program);
+	plan = resultdb_optimizer.Optimize(std::move(plan), resultdb_yannakakis_program);
 	if (resultdb_yannakakis_program) {
 		return;
 	}
@@ -255,6 +258,10 @@ void Optimizer::RunBuiltInOptimizers() {
 			JoinOrderOptimizer optimizer(context);
 			plan = optimizer.Optimize(std::move(plan));
 		});
+	}
+	plan = resultdb_optimizer.FinalizeAuto(std::move(plan), resultdb_yannakakis_program);
+	if (resultdb_yannakakis_program) {
+		return;
 	}
 
 	RunOptimizer(OptimizerType::JOIN_ELIMINATION, [&]() {
