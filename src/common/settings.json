@@ -1090,8 +1090,79 @@
         "custom_implementation": true
     },
     {
+        "name": "resultdb_cardinality_dataset",
+        "description": "Dataset key in the ResultDB cardinality JSON file",
+        "type": "VARCHAR",
+        "scope": "local",
+        "default_value": ""
+    },
+    {
+        "name": "resultdb_cardinality_file",
+        "description": "Immutable injected ResultDB cardinalities, loaded at SET time",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "resultdb_cost_build",
+        "description": "Paper ResultDB build cost weight",
+        "type": "DOUBLE",
+        "scope": "local",
+        "default_value": "3",
+        "on_callbacks": [
+            "set"
+        ]
+    },
+    {
+        "name": "resultdb_cost_decompose",
+        "description": "Paper ResultDB decompose cost weight",
+        "type": "DOUBLE",
+        "scope": "local",
+        "default_value": "1",
+        "on_callbacks": [
+            "set"
+        ]
+    },
+    {
+        "name": "resultdb_cost_join",
+        "description": "Paper ResultDB join cost weight",
+        "type": "DOUBLE",
+        "scope": "local",
+        "default_value": "1",
+        "on_callbacks": [
+            "set"
+        ]
+    },
+    {
+        "name": "resultdb_cost_probe",
+        "description": "Paper ResultDB probe cost weight",
+        "type": "DOUBLE",
+        "scope": "local",
+        "default_value": "1",
+        "on_callbacks": [
+            "set"
+        ]
+    },
+    {
+        "name": "resultdb_enumeration_limit",
+        "description": "Maximum paper ResultDB enumeration work units",
+        "type": "UBIGINT",
+        "scope": "local",
+        "default_value": "200000"
+    },
+    {
+        "name": "resultdb_optimizer",
+        "description": "ResultDB optimizer implementation (legacy or paper)",
+        "type": "VARCHAR",
+        "scope": "local",
+        "default_value": "legacy",
+        "on_callbacks": [
+            "set"
+        ]
+    },
+    {
         "name": "resultdb_strategy",
-        "description": "Execution strategy used for SELECT RESULTDB queries (decompose, semijoin, or auto)",
+        "description": "Execution strategy used for SELECT RESULTDB queries (decompose, semijoin, tdroot, tdfold_no_tvc, tdfold, auto)",
         "type": "VARCHAR",
         "default_scope": "local",
         "default_value": "decompose",
@@ -1249,5 +1320,29 @@
         "type": "UBIGINT",
         "scope": "global",
         "default_value": "4096"
+    },
+    {
+        "name": "optimizer_statistics_mode",
+        "description": "Experimental native row statistics: estimated or oracle",
+        "type": "VARCHAR",
+        "scope": "local",
+        "default_value": "estimated",
+        "on_callbacks": [
+            "set"
+        ]
+    },
+    {
+        "name": "optimizer_statistics_file",
+        "description": "Immutable native row oracle profile, loaded at SET time",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "optimizer_statistics_discovery",
+        "description": "Offline request discovery; prepared SELECT statements cannot execute",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "default_value": "false"
     }
 ]

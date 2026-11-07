@@ -10,6 +10,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/main/settings.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/optimizer/resultdb_cardinalities.hpp"
+#include <cmath>
+#include <chrono>
 
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/enums/access_mode.hpp"
@@ -20,6 +24,7 @@
 #include "duckdb/common/operator/double_cast_operator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -1583,6 +1588,75 @@ Value ProgressBarTimeSetting::GetSetting(const ClientContext &context) {
 void ResultdbStrategySetting::OnSet(SettingCallbackInfo &, Value &input) {
 	auto strategy = ResultDBStrategyFromString(input.GetValue<string>());
 	input = Value(ResultDBStrategyToString(strategy));
+}
+
+void OptimizerStatisticsModeSetting::OnSet(SettingCallbackInfo &, Value &input) {
+ auto mode = StringUtil::Lower(input.GetValue<string>());
+ if (mode != "estimated" && mode != "oracle") {
+  throw InvalidInputException("optimizer_statistics_mode must be estimated or oracle");
+ }
+ input = Value(mode);
+}
+void OptimizerStatisticsFileSetting::SetLocal(ClientContext &context, const Value &input) {
+ auto start = std::chrono::steady_clock::now();
+ auto path = input.GetValue<string>();
+ shared_ptr<const NativeRowOracleFile> file;
+ if (!path.empty()) { file = NativeRowOracleFile::Load(context, path); }
+ auto &config = ClientConfig::GetConfig(context);
+ config.native_oracle_file = std::move(file);
+ config.native_oracle_path = std::move(path);
+ config.native_oracle_load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-start).count();
+}
+void OptimizerStatisticsFileSetting::ResetLocal(ClientContext &context) {
+ auto &config = ClientConfig::GetConfig(context);
+ config.native_oracle_file.reset();
+ config.native_oracle_path.clear();
+ config.native_oracle_load_ms = 0;
+}
+Value OptimizerStatisticsFileSetting::GetSetting(const ClientContext &context) {
+ return Value(ClientConfig::GetConfig(context).native_oracle_path);
+}
+
+void ResultdbOptimizerSetting::OnSet(SettingCallbackInfo &, Value &input) {
+	auto value = StringUtil::Lower(input.GetValue<string>());
+	if (value != "legacy" && value != "paper") {
+		throw InvalidInputException("resultdb_optimizer must be legacy or paper");
+	}
+	input = Value(value);
+}
+
+static void ValidateResultDBWeight(Value &input) {
+	auto value = input.GetValue<double>();
+	if (!std::isfinite(value) || value <= 0) {
+		throw InvalidInputException("ResultDB cost weights must be finite and positive");
+	}
+}
+void ResultdbCostJoinSetting::OnSet(SettingCallbackInfo &, Value &input) { ValidateResultDBWeight(input); }
+void ResultdbCostProbeSetting::OnSet(SettingCallbackInfo &, Value &input) { ValidateResultDBWeight(input); }
+void ResultdbCostBuildSetting::OnSet(SettingCallbackInfo &, Value &input) { ValidateResultDBWeight(input); }
+void ResultdbCostDecomposeSetting::OnSet(SettingCallbackInfo &, Value &input) { ValidateResultDBWeight(input); }
+
+void ResultdbCardinalityFileSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto start = std::chrono::steady_clock::now();
+	auto path = input.GetValue<string>();
+	shared_ptr<const ResultDBCardinalityFile> loaded;
+	if (!path.empty()) {
+		loaded = ResultDBCardinalityFile::Load(context, path);
+	}
+	auto &config = ClientConfig::GetConfig(context);
+	config.resultdb_cardinalities = std::move(loaded);
+	config.resultdb_cardinality_path = std::move(path);
+	config.resultdb_cardinality_load_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+void ResultdbCardinalityFileSetting::ResetLocal(ClientContext &context) {
+	auto &config = ClientConfig::GetConfig(context);
+	config.resultdb_cardinalities.reset();
+	config.resultdb_cardinality_path.clear();
+	config.resultdb_cardinality_load_ms = 0;
+}
+Value ResultdbCardinalityFileSetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).resultdb_cardinality_path);
 }
 
 //===----------------------------------------------------------------------===//

@@ -1581,12 +1581,124 @@ struct ProgressBarTimeSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct OptimizerStatisticsModeSetting {
+ using RETURN_TYPE = string;
+ static constexpr const char *Name = "optimizer_statistics_mode";
+ static constexpr const char *Description = "Experimental native row statistics: estimated or oracle";
+ static constexpr const char *InputType = "VARCHAR";
+ static constexpr const char *DefaultValue = "estimated";
+ static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+ static void OnSet(SettingCallbackInfo &info, Value &input);
+ static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+struct OptimizerStatisticsDiscoverySetting {
+ using RETURN_TYPE = bool;
+ static constexpr const char *Name = "optimizer_statistics_discovery";
+ static constexpr const char *Description = "Offline request discovery; prepared SELECT statements cannot execute";
+ static constexpr const char *InputType = "BOOLEAN";
+ static constexpr const char *DefaultValue = "false";
+ static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+ static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+struct OptimizerStatisticsFileSetting {
+ using RETURN_TYPE = string;
+ static constexpr const char *Name = "optimizer_statistics_file";
+ static constexpr const char *Description = "Immutable native row oracle profile, loaded at SET time";
+ static constexpr const char *InputType = "VARCHAR";
+ static void SetLocal(ClientContext &context, const Value &parameter);
+ static void ResetLocal(ClientContext &context);
+ static Value GetSetting(const ClientContext &context);
+};
+
+struct ResultdbCardinalityDatasetSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "resultdb_cardinality_dataset";
+	static constexpr const char *Description = "Dataset key in the ResultDB cardinality JSON file";
+	static constexpr const char *InputType = "VARCHAR";
+	static constexpr const char *DefaultValue = "";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct ResultdbCardinalityFileSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "resultdb_cardinality_file";
+	static constexpr const char *Description = "Immutable injected ResultDB cardinalities, loaded at SET time";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct ResultdbCostBuildSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "resultdb_cost_build";
+	static constexpr const char *Description = "Paper ResultDB build cost weight";
+	static constexpr const char *InputType = "DOUBLE";
+	static constexpr const char *DefaultValue = "3";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
+struct ResultdbCostDecomposeSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "resultdb_cost_decompose";
+	static constexpr const char *Description = "Paper ResultDB decompose cost weight";
+	static constexpr const char *InputType = "DOUBLE";
+	static constexpr const char *DefaultValue = "1";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
+struct ResultdbCostJoinSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "resultdb_cost_join";
+	static constexpr const char *Description = "Paper ResultDB join cost weight";
+	static constexpr const char *InputType = "DOUBLE";
+	static constexpr const char *DefaultValue = "1";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
+struct ResultdbCostProbeSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "resultdb_cost_probe";
+	static constexpr const char *Description = "Paper ResultDB probe cost weight";
+	static constexpr const char *InputType = "DOUBLE";
+	static constexpr const char *DefaultValue = "1";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
+struct ResultdbEnumerationLimitSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "resultdb_enumeration_limit";
+	static constexpr const char *Description = "Maximum paper ResultDB enumeration work units";
+	static constexpr const char *InputType = "UBIGINT";
+	static constexpr const char *DefaultValue = "200000";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct ResultdbOptimizerSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "resultdb_optimizer";
+	static constexpr const char *Description = "ResultDB optimizer implementation (legacy or paper)";
+	static constexpr const char *InputType = "VARCHAR";
+	static constexpr const char *DefaultValue = "legacy";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
 struct ResultdbStrategySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "resultdb_strategy";
-	static constexpr const char *Description =
-	    "Planning strategy used for SELECT RESULTDB queries (decompose, semijoin, tdroot, tdfold_no_tvc, "
-	    "tdfold, or auto)";
+	static constexpr const char *Description = "Execution strategy used for SELECT RESULTDB queries (decompose, semijoin, tdroot, tdfold_no_tvc, tdfold, auto)";
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "decompose";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
@@ -1805,6 +1917,7 @@ struct ZstdMinStringLengthSetting {
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
+
 
 struct GeneratedSettingInfo {
 	static constexpr idx_t MaxSettingIndex = NEXT_SETTING_INDEX();
