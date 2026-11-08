@@ -10,6 +10,8 @@ add_subdirectory(capi)
 
 set(TEST_API_OBJECTS
     test_api.cpp
+    test_resultdb_paper.cpp
+    test_native_row_oracle.cpp
     test_config.cpp
     test_custom_allocator.cpp
     test_extension_setting_autoload.cpp

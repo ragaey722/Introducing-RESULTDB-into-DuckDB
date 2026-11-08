@@ -25,6 +25,8 @@
 #include "duckdb/optimizer/remove_duplicate_groups.hpp"
 #include "duckdb/optimizer/remove_unused_columns.hpp"
 #include "duckdb/optimizer/resultdb_optimizer.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/optimizer/row_group_pruner.hpp"
 #include "duckdb/optimizer/rule/distinct_aggregate_optimizer.hpp"
 #include "duckdb/optimizer/rule/equal_or_null_simplification.hpp"
@@ -206,6 +208,10 @@ void Optimizer::RunBuiltInOptimizers() {
 	});
 
 	plan = resultdb_optimizer.Optimize(std::move(plan), resultdb_yannakakis_program);
+	auto internal_oracle = ClientConfig::GetConfig(context).native_oracle_active;
+	if (internal_oracle && internal_oracle->IsInternal()) {
+		internal_oracle->Refresh(*plan, "optimized_inputs");
+	}
 	if (resultdb_yannakakis_program) {
 		return;
 	}
@@ -302,6 +308,9 @@ void Optimizer::RunBuiltInOptimizers() {
 	// Once we know the column lifetime, we have more information regarding
 	// what relations should be the build side/probe side.
 	RunOptimizer(OptimizerType::BUILD_SIDE_PROBE_SIDE, [&]() {
+		if (internal_oracle && internal_oracle->IsInternal()) {
+			internal_oracle->Refresh(*plan, "before_build_probe");
+		}
 		BuildProbeSideOptimizer build_probe_side_optimizer(context, *plan);
 		build_probe_side_optimizer.VisitOperator(*plan);
 	});
@@ -400,6 +409,9 @@ void Optimizer::RunBuiltInOptimizers() {
 		RowNumberRewriter window_rewriter;
 		plan = window_rewriter.Optimize(std::move(plan));
 	});
+	if (internal_oracle && internal_oracle->IsInternal()) {
+		internal_oracle->Refresh(*plan, "physical_input");
+	}
 }
 
 unique_ptr<LogicalOperator> Optimizer::Optimize(unique_ptr<LogicalOperator> plan_p) {

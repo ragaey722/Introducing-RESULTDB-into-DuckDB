@@ -5,6 +5,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 
 namespace duckdb {
 class ClientContext;
@@ -45,6 +46,8 @@ public:
 	struct Description {
 		uint64_t relations = 0;
 		vector<string> predicates;
+		//! Empty for a bag; otherwise count distinct values of these resolved expressions.
+		vector<string> distinct_columns;
 	};
 	shared_ptr<const NativeRowOracleFile> file;
 	string query_sha256, database_path;
@@ -52,12 +55,17 @@ public:
 	idx_t missing = 0, native_join_searches = 0;
 	unordered_map<string, Request> requests;
 	unordered_map<const LogicalOperator *, idx_t> pinned;
+	vector<string> internal_physical_plans;
 
 	DUCKDB_API NativeRowOracle(ClientContext &context, LogicalOperator &plan, const string &query,
 	                          shared_ptr<const NativeRowOracleFile> file, bool discovery);
+	//! A working-plan view with its own bindings/pins and the original preparation's profile/audit.
+	NativeRowOracle(NativeRowOracle &parent, LogicalOperator &plan, idx_t working_relation);
 	DUCKDB_API string ToJSON() const;
+	bool IsInternal() const { return audit_parent != nullptr; }
+	void Refresh(LogicalOperator &plan, const string &stage);
 	shared_ptr<NativeRowOracleGraph> BindGraph(QueryGraphManager &graph);
-	idx_t Pin(LogicalOperator &op);
+	idx_t Pin(LogicalOperator &op, const string &stage = "");
 	idx_t Raw(LogicalGet &get, idx_t fallback);
 	Description Describe(LogicalOperator &op);
 	string Render(const Expression &expression) const;
@@ -68,7 +76,6 @@ public:
 
 private:
 	struct Scan {
-		LogicalGet *get;
 		string from, schema;
 		idx_t ordinal;
 	};
@@ -76,6 +83,11 @@ private:
 	vector<idx_t> scan_order;
 	//! IN-clause MARK columns describe boolean predicates, not new base occurrences.
 	unordered_map<idx_t, unique_ptr<Expression>> constant_marks;
+	column_binding_map_t<string> columns;
+	NativeRowOracle *audit_parent = nullptr;
+	string phase;
+	void RegisterBindings(LogicalOperator &plan);
+	idx_t LookupRequest(const string &schema, const string &sql, idx_t fallback, const string &stage);
 	void CollectScans(ClientContext &context, LogicalOperator &op);
 };
 

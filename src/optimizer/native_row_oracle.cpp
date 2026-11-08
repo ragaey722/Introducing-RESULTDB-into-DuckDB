@@ -211,7 +211,7 @@ void NativeRowOracle::CollectScans(ClientContext &context, LogicalOperator &op) 
 			schema += "|" + std::to_string(get.names[i].size()) + ":" + get.names[i] + ":" + get.returned_types[i].ToString();
 		}
 		auto id = get.table_index.index;
-		if (!scans.emplace(id, Scan {&get, from + " AS " + Identifier("r" + std::to_string(id)), schema, 0}).second) {
+		if (!scans.emplace(id, Scan {from + " AS " + Identifier("r" + std::to_string(id)), schema, 0}).second) {
 			throw InvalidInputException("Native row oracle: duplicate occurrence identity");
 		}
 		scan_order.push_back(id);
@@ -239,6 +239,7 @@ NativeRowOracle::NativeRowOracle(ClientContext &context, LogicalOperator &plan, 
 	for (idx_t i = 0; i < scan_order.size(); i++) {
 		scans.at(scan_order[i]).ordinal = i;
 	}
+	RegisterBindings(plan);
 	if (file) {
 		auto &fs = FileSystem::GetFileSystem(context);
 		auto handle = fs.OpenFile(database_path, FileFlags::FILE_FLAGS_READ);
@@ -249,8 +250,69 @@ NativeRowOracle::NativeRowOracle(ClientContext &context, LogicalOperator &plan, 
 	}
 }
 
+NativeRowOracle::NativeRowOracle(NativeRowOracle &parent, LogicalOperator &plan, idx_t working_relation)
+    : file(parent.file), query_sha256(parent.query_sha256), database_path(parent.database_path),
+      discovery(parent.discovery), scans(parent.scans), scan_order(parent.scan_order), audit_parent(&parent),
+      phase("internal[" + std::to_string(working_relation) + "]") {
+	RegisterBindings(plan);
+}
+
+void NativeRowOracle::RegisterBindings(LogicalOperator &op) {
+	for (auto &child : op.children) {
+		RegisterBindings(*child);
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		if (scans.find(get.table_index.index) == scans.end()) {
+			throw InvalidInputException("Native row oracle: unknown internal scan %llu", get.table_index.index);
+		}
+		for (idx_t i = 0; i < get.GetColumnIds().size(); i++) {
+			auto binding = ColumnBinding(get.table_index, ProjectionIndex(i));
+			columns[binding] = native_oracle_json::Identifier("r" + std::to_string(get.table_index.index)) + "." +
+			                   native_oracle_json::Identifier(get.GetColumnName(get.GetColumnIndex(binding)));
+		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &projection = op.Cast<LogicalProjection>();
+		for (idx_t i = 0; i < projection.expressions.size(); i++) {
+			auto &expression = *projection.expressions[i];
+			auto text = Render(expression);
+			columns[ColumnBinding(projection.table_index, ProjectionIndex(i))] =
+			    expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF ? text : "(" + text + ")";
+		}
+	}
+}
+
+void NativeRowOracle::Refresh(LogicalOperator &plan, const string &stage) {
+	RegisterBindings(plan);
+	for (auto &child : plan.children) {
+		Refresh(*child, stage);
+	}
+	if (plan.type != LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+		Pin(plan, stage);
+	}
+}
+
 string NativeRowOracle::Render(const Expression &expression) const {
 	auto copy = expression.Copy();
+	if (IsInternal()) {
+		// Compression/decompression introduced by materialization are reversible
+		// encodings. Count their original values, not private engine functions.
+		std::function<void(unique_ptr<Expression> &)> resolve_encoding = [&](unique_ptr<Expression> &expr) {
+			ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) { resolve_encoding(child); });
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+				auto &function = expr->Cast<BoundFunctionExpression>();
+				if (StringUtil::StartsWith(function.function.GetName(), "__internal_compress_") ||
+				    StringUtil::StartsWith(function.function.GetName(), "__internal_decompress_")) {
+					if (function.children.empty()) {
+						throw InvalidInputException("Native row oracle: invalid internal encoding");
+					}
+					auto original = std::move(function.children[0]);
+					expr = std::move(original);
+				}
+			}
+		};
+		resolve_encoding(copy);
+	}
 	if (copy->IsVolatile() || copy->HasParameter() || copy->HasSubquery()) {
 		throw InvalidInputException("Native row oracle requires deterministic parameter-free predicates");
 	}
@@ -262,18 +324,17 @@ string NativeRowOracle::Render(const Expression &expression) const {
 			slot = mark->second->Copy();
 			return;
 		}
-		auto entry = scans.find(col.binding.table_index.index);
-		if (col.depth || entry == scans.end()) {
+		auto entry = columns.find(col.binding);
+		if (col.depth || entry == columns.end()) {
 			throw InvalidInputException("Native row oracle: unknown/derived column binding %s", col.binding.ToString());
 		}
-		auto &get = *entry->second.get;
-		col.SetAlias(native_oracle_json::Identifier("r" + std::to_string(get.table_index.index)) + "." +
-		             native_oracle_json::Identifier(get.GetColumnName(get.GetColumnIndex(col.binding))));
+		col.SetAlias(entry->second);
 	});
 	return copy->ToString();
 }
 
 NativeRowOracle::Description NativeRowOracle::Describe(LogicalOperator &op) {
+	RegisterBindings(op);
 	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		if (join.join_type == JoinType::MARK && join.children.size() == 2 &&
@@ -293,13 +354,11 @@ NativeRowOracle::Description NativeRowOracle::Describe(LogicalOperator &op) {
 			auto input = condition.GetLHS().Copy();
 			// Resolve base aliases once before storing the replacement expression.
 			ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(input, [&](BoundColumnRefExpression &col, unique_ptr<Expression> &) {
-				auto entry = scans.find(col.binding.table_index.index);
-				if (col.depth || entry == scans.end()) {
+				auto entry = columns.find(col.binding);
+				if (col.depth || entry == columns.end()) {
 					throw InvalidInputException("Native row oracle: unsupported constant MARK input");
 				}
-				auto &get = *entry->second.get;
-				col.SetAlias(native_oracle_json::Identifier("r" + std::to_string(get.table_index.index)) + "." +
-				             native_oracle_json::Identifier(get.GetColumnName(get.GetColumnIndex(col.binding))));
+				col.SetAlias(entry->second);
 			});
 			predicate->children.push_back(std::move(input));
 			ColumnDataScanState state;
@@ -324,6 +383,12 @@ NativeRowOracle::Description NativeRowOracle::Describe(LogicalOperator &op) {
 		auto part = Describe(*child);
 		result.relations |= part.relations;
 		result.predicates.insert(result.predicates.end(), part.predicates.begin(), part.predicates.end());
+		if (!part.distinct_columns.empty()) {
+			if (op.children.size() != 1) {
+				throw InvalidInputException("Native row oracle: joins above working DISTINCT are unsupported");
+			}
+			result.distinct_columns = std::move(part.distinct_columns);
+		}
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
@@ -356,6 +421,14 @@ NativeRowOracle::Description NativeRowOracle::Describe(LogicalOperator &op) {
 				result.predicates.push_back(Render(cond.GetJoinExpression()));
 			}
 		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_DISTINCT && IsInternal()) {
+		auto &distinct = op.Cast<LogicalDistinct>();
+		if (distinct.distinct_type != DistinctType::DISTINCT || !result.distinct_columns.empty()) {
+			throw InvalidInputException("Native row oracle: unsupported working DISTINCT");
+		}
+		for (auto &target : distinct.distinct_targets) {
+			result.distinct_columns.push_back(Render(*target));
+		}
 	} else if (op.type != LogicalOperatorType::LOGICAL_PROJECTION && op.type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 		throw InvalidInputException("Native row oracle: unsupported cardinality stage %s", op.GetName());
 	}
@@ -367,6 +440,9 @@ idx_t NativeRowOracle::Lookup(Description description, idx_t fallback, const str
 }
 
 idx_t NativeRowOracle::LookupReduction(Description description, Description right, idx_t fallback, const string &stage) {
+	if (!right.distinct_columns.empty() || (!description.distinct_columns.empty() && right.relations)) {
+		throw InvalidInputException("Native row oracle: reductions of working DISTINCT are unsupported");
+	}
 	if (description.relations & right.relations) {
 		throw InternalException("Native row oracle: overlapping reduction occurrences");
 	}
@@ -402,7 +478,24 @@ idx_t NativeRowOracle::LookupReduction(Description description, Description righ
 		}
 		sql += ")";
 	}
-	auto schema = NativeRowOracleFile::Hash(StringUtil::Join(schemas, "\n"));
+	if (!description.distinct_columns.empty()) {
+		auto &targets = description.distinct_columns;
+		std::sort(targets.begin(), targets.end());
+		targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+		vector<string> projected;
+		for (idx_t i = 0; i < targets.size(); i++) {
+			projected.push_back(targets[i] + " AS c" + std::to_string(i));
+		}
+		sql = "SELECT COUNT(*) FROM (SELECT DISTINCT " + StringUtil::Join(projected, ", ") +
+		      sql.substr(string("SELECT COUNT(*)").size()) + ") AS oracle_distinct";
+	}
+	return LookupRequest(NativeRowOracleFile::Hash(StringUtil::Join(schemas, "\n")), sql, fallback, stage);
+}
+
+idx_t NativeRowOracle::LookupRequest(const string &schema, const string &sql, idx_t fallback, const string &stage) {
+	if (audit_parent) {
+		return audit_parent->LookupRequest(schema, sql, fallback, phase + ":" + stage);
+	}
 	auto key = NativeRowOracleFile::Key(query_sha256, schema, sql);
 	auto existing = requests.find(key);
 	if (existing != requests.end()) {
@@ -441,13 +534,36 @@ idx_t NativeRowOracle::Raw(LogicalGet &get, idx_t fallback) {
 	return Lookup(std::move(description), fallback, "raw_scan");
 }
 
-idx_t NativeRowOracle::Pin(LogicalOperator &op) {
+idx_t NativeRowOracle::Pin(LogicalOperator &op, const string &stage) {
 	if (op.type == LogicalOperatorType::LOGICAL_CHUNK_GET) {
 		// Native IN rewriting creates a known constant list. It is not a database
 		// occurrence and its native count is already exact.
 		return op.estimated_cardinality;
 	}
-	auto value = Lookup(Describe(op), op.estimated_cardinality, op.GetName());
+	if (IsInternal()) {
+		// Only an actual logical empty-result proof qualifies here. An injected
+		// zero estimate is never used to infer emptiness.
+		std::function<bool(LogicalOperator &)> empty = [&](LogicalOperator &node) {
+			if (node.type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) { return true; }
+			bool propagates = node.type == LogicalOperatorType::LOGICAL_PROJECTION ||
+			                  node.type == LogicalOperatorType::LOGICAL_FILTER ||
+			                  node.type == LogicalOperatorType::LOGICAL_DISTINCT ||
+			                  node.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT ||
+			                  (node.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+			                   node.Cast<LogicalComparisonJoin>().join_type == JoinType::INNER);
+			if (propagates) {
+				for (auto &child : node.children) { if (empty(*child)) { return true; } }
+			}
+			return false;
+		};
+		if (empty(op)) {
+			op.SetEstimatedCardinality(0);
+			pinned[&op] = 0;
+			return 0;
+		}
+	}
+	auto value = Lookup(Describe(op), op.estimated_cardinality,
+	                    stage.empty() ? op.GetName() : stage + ":" + op.GetName());
 	op.SetEstimatedCardinality(value);
 	pinned[&op] = value;
 	return value;
@@ -468,7 +584,11 @@ shared_ptr<NativeRowOracleGraph> NativeRowOracle::BindGraph(QueryGraphManager &g
 		}
 		result->predicates.emplace_back(mask, Render(*filter->filter));
 	}
-	native_join_searches++;
+	if (audit_parent) {
+		audit_parent->native_join_searches++;
+	} else {
+		native_join_searches++;
+	}
 	return result;
 }
 
@@ -514,6 +634,11 @@ string NativeRowOracle::ToJSON() const {
 		result += "{\"key\":" + Quote(key) + ",\"query_sha256\":" + Quote(query_sha256) + ",\"schema\":" + Quote(entry.schema) +
 		          ",\"sql\":" + Quote(entry.sql) + ",\"stage\":" + Quote(entry.stage) + ",\"found\":" + (entry.found ? "true" : "false") +
 		          ",\"cardinality\":" + std::to_string(entry.cardinality) + ",\"calls\":" + std::to_string(entry.calls) + "}";
+	}
+	result += "],\"internal_physical_plans\":[";
+	for (idx_t i = 0; i < internal_physical_plans.size(); i++) {
+		if (i) { result += ","; }
+		result += Quote(internal_physical_plans[i]);
 	}
 	return result + "]}";
 }

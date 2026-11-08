@@ -18,6 +18,7 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/table_binding.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_expanded_expression.hpp"
@@ -770,6 +771,11 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 	result.column_count = new_names.size();
 	result.names = std::move(new_names);
 	result.need_prune = result.select_list.size() > result.column_count;
+	if (Settings::Get<ResultdbOptimizerSetting>(context) == "paper") {
+		for (auto &binding : bind_context.GetBindingsList()) {
+			GetStatementProperties().resultdb.occurrence_aliases[binding->GetIndex().index] = binding->GetAlias();
+		}
+	}
 	if (statement.resultdb) {
 		D_ASSERT(resultdb_columns.size() == result.names.size());
 		auto &properties = GetStatementProperties();

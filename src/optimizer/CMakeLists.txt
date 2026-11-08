@@ -31,12 +31,14 @@ add_library_unity(
   late_materialization.cpp
   late_materialization_helper.cpp
   optimizer.cpp
+  native_row_oracle.cpp
   outer_join_simplification.cpp
   partitioned_execution.cpp
   join_elimination.cpp
   regex_range_filter.cpp
-  resultdb_plan_enumerator.cpp
-  resultdb_yannakakis_optimizer.cpp
+  resultdb_paper_enumerator.cpp
+  resultdb_cardinalities.cpp
+  resultdb_optimizer.cpp
   remove_duplicate_groups.cpp
   remove_unused_columns.cpp
   row_group_pruner.cpp

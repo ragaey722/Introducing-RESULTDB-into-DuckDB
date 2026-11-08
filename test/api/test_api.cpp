@@ -7,7 +7,8 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/planner/resultdb_reduced_plan.hpp"
-#include "duckdb/optimizer/resultdb_plan_enumerator.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/optimizer/resultdb_cardinalities.hpp"
 #include "duckdb/common/types/hash.hpp"
 
 #include <algorithm>
@@ -17,27 +18,6 @@
 using namespace duckdb;
 
 using ResultRow = vector<Value>;
-
-class TestResultDBEnumerationCosts : public ResultDBEnumerationCostProvider {
-public:
-	explicit TestResultDBEnumerationCosts(vector<double> cardinalities_p)
-	    : cardinalities(std::move(cardinalities_p)) {
-	}
-
-	double Cardinality(const vector<idx_t> &nodes) override {
-		double result = 0;
-		for (auto node : nodes) {
-			result = std::max(result, cardinalities[node]);
-		}
-		return result;
-	}
-
-	double PayloadWidth(const vector<idx_t> &nodes) override {
-		return static_cast<double>(std::max<idx_t>(nodes.size(), 1));
-	}
-
-	vector<double> cardinalities;
-};
 
 struct ResultRowHash {
 	size_t operator()(const ResultRow &row) const {
@@ -492,8 +472,8 @@ TEST_CASE("Test ResultDB strategy setting", "[api]") {
 	    {"tdroot", "tdroot", ResultDBStrategy::TDROOT, ResultDBStrategy::SEMIJOIN},
 	    {"tdfold-no-tvc", "tdfold_no_tvc", ResultDBStrategy::TDFOLD_NO_TVC, ResultDBStrategy::SEMIJOIN},
 	    {"tdfold", "tdfold", ResultDBStrategy::TDFOLD, ResultDBStrategy::SEMIJOIN},
-	    {"auto", "auto", ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN},
-	    {"tdresultdb", "auto", ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN},
+	    {"auto", "auto", ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE},
+	    {"tdresultdb", "auto", ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE},
 	};
 
 	const string from_clause = " FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount >= 100";
@@ -504,6 +484,13 @@ TEST_CASE("Test ResultDB strategy setting", "[api]") {
 		REQUIRE(CHECK_COLUMN(setting_result, 0, {strategy_case.stored_value}));
 
 		duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + from_clause);
+		if (strategy_case.requested_strategy == ResultDBStrategy::TDROOT ||
+		    strategy_case.requested_strategy == ResultDBStrategy::TDFOLD_NO_TVC ||
+		    strategy_case.requested_strategy == ResultDBStrategy::TDFOLD) {
+			REQUIRE(result->HasError());
+			REQUIRE(result->GetError().find("requires resultdb_optimizer='paper'") != string::npos);
+			continue;
+		}
 		INFO(result->GetError());
 		REQUIRE(!result->HasError());
 		RequireResultDBStrategy(*result, strategy_case.requested_strategy, strategy_case.execution_strategy);
@@ -737,6 +724,23 @@ TEST_CASE("Test ResultDB semijoin reuses fused composite-key phases at T1 and T6
 	REQUIRE(expected_c->Cast<MaterializedQueryResult>().RowCount() == 2);
 
 	const string resultdb_query = "SELECT RESULTDB a.payload, b.payload, c.payload" + from_clause;
+	// Exact join-bag and semijoin-survivor counts for this composite-key fixture.
+	ClientConfig::GetConfig(*con.context).resultdb_cardinalities = ResultDBCardinalityFile::Parse(R"({"fixture":[
+	  {"relations":["a"],"size":7,"reductions":[
+	    {"right_relations":["b"],"size":5},{"right_relations":["c"],"size":7},
+	    {"right_relations":["b","c"],"size":4}]},
+	  {"relations":["b"],"size":7,"reductions":[
+	    {"right_relations":["a"],"size":5},{"right_relations":["c"],"size":5},
+	    {"right_relations":["a","c"],"size":4}]},
+	  {"relations":["c"],"size":6,"reductions":[
+	    {"right_relations":["a"],"size":6},{"right_relations":["b"],"size":4},
+	    {"right_relations":["a","b"],"size":4}]},
+	  {"relations":["a","b"],"size":7,"reductions":[{"right_relations":["c"],"size":6}]},
+	  {"relations":["a","c"],"size":42,"reductions":[{"right_relations":["b"],"size":6}]},
+	  {"relations":["b","c"],"size":7,"reductions":[{"right_relations":["a"],"size":6}]},
+	  {"relations":["a","b","c"],"size":10}
+	]})");
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_cardinality_dataset='fixture'; SET resultdb_optimizer='paper'"));
 	for (auto &strategy : vector<std::pair<string, ResultDBStrategy>> {
 	         {"semijoin", ResultDBStrategy::SEMIJOIN},
 	         {"tdroot", ResultDBStrategy::TDROOT},
@@ -832,37 +836,18 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	RequireResultDBTable(*result, "c", *expected_cyclic_c);
 	REQUIRE(!result->next);
 
-	struct EnumeratedStrategyCase {
-		string setting;
-		ResultDBStrategy requested;
-	};
-	for (auto &strategy : vector<EnumeratedStrategyCase> {
-	         {"tdroot", ResultDBStrategy::TDROOT},
-	         {"tdfold_no_tvc", ResultDBStrategy::TDFOLD_NO_TVC},
-	         {"tdfold", ResultDBStrategy::TDFOLD}}) {
-		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy.setting + "'"));
+	for (auto &strategy : vector<string> {"tdroot", "tdfold_no_tvc", "tdfold"}) {
+		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy + "'"));
 		result = con.Query("SELECT RESULTDB *" + cyclic_from);
-		INFO(result->GetError());
-		REQUIRE(!result->HasError());
-		RequireResultDBStrategy(*result, strategy.requested, ResultDBStrategy::SEMIJOIN);
-		REQUIRE(result->properties.resultdb.selected_root_table_index != DConstants::INVALID_INDEX);
-		REQUIRE(result->properties.resultdb.enumeration_time_ms >= 0);
-		REQUIRE(result->properties.resultdb.join_edges.size() == 3);
-		RequireResultDBTable(*result, "a", *expected_cyclic_a);
-		result = std::move(result->next);
-		REQUIRE(result);
-		RequireResultDBTable(*result, "b", *expected_cyclic_b);
-		result = std::move(result->next);
-		REQUIRE(result);
-		RequireResultDBTable(*result, "c", *expected_cyclic_c);
-		REQUIRE(!result->next);
+		REQUIRE(result->HasError());
+		REQUIRE(result->GetError().find("requires resultdb_optimizer='paper'") != string::npos);
 	}
 
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
 	result = con.Query("SELECT RESULTDB *" + cyclic_from);
 	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN);
-	REQUIRE(result->properties.resultdb.join_edges.size() == 3);
+	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
+	REQUIRE(result->properties.resultdb.join_edges.empty());
 	RequireResultDBTable(*result, "a", *expected_cyclic_a);
 	result = std::move(result->next);
 	REQUIRE(result);
@@ -896,7 +881,7 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
 	result = con.Query("SELECT RESULTDB *" + cross_table_where_from);
 	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN);
+	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
 
 	const string cross_product_where_from = " FROM a, b WHERE a.id = b.a_id";
 	auto expected_cross_product_a = con.Query("SELECT DISTINCT a.id" + cross_product_where_from);
@@ -960,7 +945,8 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	result = con.Query("SELECT RESULTDB *" + redundant_equality_from);
 	REQUIRE(!result->HasError());
 	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
-	REQUIRE(result->properties.resultdb.join_edges.size() == 2);
+	// The original triangle remains authoritative, including its redundant equality.
+	REQUIRE(result->properties.resultdb.join_edges.size() == 3);
 	RequireResultDBTable(*result, "a", *expected_redundant_a);
 	result = std::move(result->next);
 	REQUIRE(result);
@@ -984,7 +970,8 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	result = con.Query("SELECT RESULTDB * FROM a JOIN b ON a.id = b.a_id WHERE 1 = 0");
 	REQUIRE(!result->HasError());
 	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
-	REQUIRE(result->properties.resultdb.join_edges.empty());
+	// Capture precedes the proof of emptiness, so diagnostics retain the original edge.
+	REQUIRE(result->properties.resultdb.join_edges.size() == 1);
 	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 0);
 	duckdb::unique_ptr<QueryResult> next_result = std::move(result->next);
 	REQUIRE(next_result);
@@ -995,7 +982,7 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 		result = con.Query("SELECT RESULTDB *" + from_clause);
 		REQUIRE(!result->HasError());
 		RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
-		REQUIRE(result->properties.resultdb.join_edges.empty());
+		REQUIRE(result->properties.resultdb.join_edges.size() == 1);
 		REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 0);
 		next_result = std::move(result->next);
 		REQUIRE(next_result);
@@ -1024,34 +1011,6 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	REQUIRE(result);
 	RequireResultDBTable(*result, "h", *expected_regex_hits);
 	REQUIRE(!result->next);
-}
-
-TEST_CASE("Test ResultDB TDResultDB cost comparison selects both executors", "[api][resultdb]") {
-	DuckDB db(nullptr);
-	Connection con(db);
-
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE narrow_a(k BOOLEAN)"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE narrow_b(k BOOLEAN)"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO narrow_a VALUES (TRUE), (FALSE)"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO narrow_b VALUES (TRUE), (FALSE)"));
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
-	auto result = con.Query("SELECT RESULTDB * FROM narrow_a a JOIN narrow_b b ON a.k = b.k");
-	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
-	REQUIRE(result->properties.resultdb.estimated_decompose_cost <=
-	        result->properties.resultdb.estimated_semijoin_cost);
-	REQUIRE(result->properties.resultdb.planning_reason.find("selected decompose") != string::npos);
-
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wide_a(k INTEGER, payload VARCHAR)"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wide_b(k INTEGER, payload VARCHAR)"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO wide_a VALUES (1, repeat('a', 100)), (2, repeat('b', 100))"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO wide_b VALUES (1, repeat('c', 100)), (2, repeat('d', 100))"));
-	result = con.Query("SELECT RESULTDB * FROM wide_a a JOIN wide_b b ON a.k = b.k");
-	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::SEMIJOIN);
-	REQUIRE(result->properties.resultdb.estimated_semijoin_cost <
-	        result->properties.resultdb.estimated_decompose_cost);
-	REQUIRE(result->properties.resultdb.planning_reason.find("selected TDFold+TDRoot") != string::npos);
 }
 
 TEST_CASE("Test ResultDB query returns larger source relation set", "[api]") {
@@ -2212,56 +2171,4 @@ TEST_CASE("Test ClientInterruptState suppresses interrupts after irreversible op
 		context.ClearInterrupt();
 		REQUIRE_NO_FAIL(con.Query("DROP TABLE suppress_test"));
 	}
-}
-
-TEST_CASE("Test ResultDB TDRoot enumerates roots and explicit sibling orders", "[api][resultdb]") {
-	ResultDBEnumerationInput input;
-	input.nodes = {{10, 100, false}, {20, 10, false}, {30, 1, true}};
-	input.edges = {{0, 1}, {1, 2}};
-	TestResultDBEnumerationCosts costs({100, 10, 1});
-
-	auto result = ResultDBPlanEnumerator::EnumerateRoot(input, costs);
-	REQUIRE(result.valid);
-	// The high-cardinality unrequested endpoint is cheapest because it hashes
-	// the already reduced middle relation instead of being used as a hash source.
-	REQUIRE(result.root == 0);
-	REQUIRE(result.order == vector<idx_t> {0, 1, 2});
-	REQUIRE(result.bottom_up_children[1] == vector<idx_t> {2});
-	REQUIRE(result.top_down_children[0] == vector<idx_t> {1});
-	REQUIRE(result.top_down_children[1] == vector<idx_t> {2});
-
-	ResultDBEnumerationInput star;
-	star.nodes = {{1, 100, true}, {2, 50, false}, {3, 1, false}, {4, 20, false}};
-	star.edges = {{0, 1}, {0, 2}, {0, 3}};
-	TestResultDBEnumerationCosts star_costs({100, 50, 1, 20});
-	auto star_result = ResultDBPlanEnumerator::EnumerateRoot(star, star_costs);
-	REQUIRE(star_result.valid);
-	if (star_result.root == 0) {
-		REQUIRE(star_result.bottom_up_children[0] == vector<idx_t> {2, 3, 1});
-	}
-}
-
-TEST_CASE("Test ResultDB TDFold enumerates blocks, SC candidates, and TVCs", "[api][resultdb]") {
-	ResultDBEnumerationInput triangle;
-	triangle.nodes = {{1, 10, true}, {2, 20, true}, {3, 30, true}};
-	triangle.edges = {{0, 1}, {1, 2}, {0, 2}};
-	TestResultDBEnumerationCosts triangle_costs({10, 20, 30});
-
-	auto no_tvc = ResultDBPlanEnumerator::EnumerateFolds(triangle, triangle_costs, false);
-	REQUIRE(no_tvc.valid);
-	REQUIRE(no_tvc.block_sizes == vector<idx_t> {3});
-	REQUIRE(no_tvc.candidate_count > 1);
-	REQUIRE(!no_tvc.folds.empty());
-
-	// Two triangles sharing an edge have the adjacent two-vertex cut {0,1}.
-	ResultDBEnumerationInput shared_edge;
-	shared_edge.nodes = {{1, 10, true}, {2, 10, true}, {3, 5, false}, {4, 5, false}};
-	shared_edge.edges = {{0, 1}, {0, 2}, {1, 2}, {0, 3}, {1, 3}};
-	TestResultDBEnumerationCosts shared_costs({10, 10, 5, 5});
-	auto without_tvc = ResultDBPlanEnumerator::EnumerateFolds(shared_edge, shared_costs, false);
-	auto with_tvc = ResultDBPlanEnumerator::EnumerateFolds(shared_edge, shared_costs, true);
-	REQUIRE(without_tvc.valid);
-	REQUIRE(with_tvc.valid);
-	REQUIRE(with_tvc.used_tvc);
-	REQUIRE(with_tvc.candidate_count >= without_tvc.candidate_count);
 }

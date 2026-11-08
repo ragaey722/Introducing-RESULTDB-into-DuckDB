@@ -90,12 +90,21 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalOper
 
 	auto oracle = ClientConfig::GetConfig(context).native_oracle_active;
 	if (oracle && node_ptr->type != LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
-		auto found = oracle->pinned.find(&node);
-		if (found != oracle->pinned.end()) {
-			node_ptr->SetEstimatedCardinality(found->second);
-			if (result) {
-				result->estimated_cardinality = found->second;
-				result->has_estimated_cardinality = true;
+		if (oracle->IsInternal()) {
+			auto value = oracle->Pin(*node_ptr, "statistics");
+			if (!result) {
+				result = make_uniq<NodeStatistics>();
+			}
+			result->estimated_cardinality = value;
+			result->has_estimated_cardinality = true;
+		} else {
+			auto found = oracle->pinned.find(&node);
+			if (found != oracle->pinned.end()) {
+				node_ptr->SetEstimatedCardinality(found->second);
+				if (result) {
+					result->estimated_cardinality = found->second;
+					result->has_estimated_cardinality = true;
+				}
 			}
 		}
 	}

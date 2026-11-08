@@ -16,6 +16,8 @@
 #include "duckdb/common/enums/database_modification_type.hpp"
 
 namespace duckdb {
+class ResultDBCardinalityFile;
+class NativeRowOracle;
 
 //===--------------------------------------------------------------------===//
 // Statement Types
@@ -111,6 +113,22 @@ struct ResultDBJoinEdgeMetadata {
 
 struct ResultDBProperties {
 	bool enabled = false;
+	bool paper_planned = false;
+	bool planning_phase = false;
+	unordered_map<idx_t, string> occurrence_aliases;
+	shared_ptr<const ResultDBCardinalityFile> cardinality_snapshot;
+	string cardinality_sha256;
+	string cardinality_dataset;
+	string optimizer_mode;
+	string selected_join_tree;
+	string reduction_schedule;
+	double cardinality_load_ms = 0;
+	vector<double> cost_weights;
+	idx_t cardinality_lookups = 0;
+	idx_t enumeration_work = 0;
+	double estimated_join_cost = 0;
+	double estimated_decomposition_cost = 0;
+	double estimated_reduction_cost = 0;
 	//! Strategy requested through SET resultdb_strategy.
 	ResultDBStrategy requested_strategy = ResultDBStrategy::DECOMPOSE;
 	//! Physical strategy chosen by planning.
@@ -168,6 +186,9 @@ struct StatementProperties {
 	QueryResultOutputType output_type;
 	//! SELECT RESULTDB metadata produced by the binder and consumed by the result collector for decomposition
 	ResultDBProperties resultdb;
+	//! Native optimizer statistics snapshot and preparation audit.
+	string native_statistics_mode = "estimated";
+	shared_ptr<NativeRowOracle> native_row_oracle;
 	//! Whether or not all parameters have successfully had their types determined
 	bool bound_all_parameters;
 	//! What type of data the statement returns

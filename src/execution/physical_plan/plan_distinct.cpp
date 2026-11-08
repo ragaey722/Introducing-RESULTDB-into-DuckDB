@@ -6,6 +6,8 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
 #include "duckdb/optimizer/rule/ordered_aggregate_optimizer.hpp"
 
 namespace duckdb {
@@ -88,6 +90,11 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalDistinct &op) {
 	auto &group_by = Make<PhysicalHashAggregate>(context, aggregate_types, std::move(aggregates), std::move(groups),
 	                                             child.get().estimated_cardinality);
 	group_by.children.push_back(child);
+	auto oracle = ClientConfig::GetConfig(context).native_oracle_active;
+	if (oracle && oracle->IsInternal()) {
+		// The child is the input bag; this operator emits distinct working tuples.
+		group_by.estimated_cardinality = op.estimated_cardinality;
+	}
 	if (!requires_projection) {
 		return group_by;
 	}

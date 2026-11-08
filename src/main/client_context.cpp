@@ -1,4 +1,5 @@
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/optimizer/native_row_oracle.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -753,6 +754,7 @@ static unique_ptr<PhysicalPlan> PlanResultDBYannakakisPhase(ClientContext &conte
 	if (optimize && logical_plan->RequireOptimizer()) {
 		auto resultdb_properties = binder.GetStatementProperties().resultdb;
 		binder.GetStatementProperties().resultdb.enabled = false;
+		binder.GetStatementProperties().resultdb.planning_phase = true;
 		Optimizer optimizer(binder, context);
 		optimizer.skip_join_order = preserve_join_order;
 		try {
@@ -798,9 +800,21 @@ PrepareResultDBYannakakisProgram(ClientContext &context, Binder &binder, ResultD
 	prepared->relations.reserve(program.relations.size());
 	prepared->base_plans.reserve(program.relations.size());
 	for (auto &relation : program.relations) {
+		// Internal bindings belong to this working plan, while requests and file
+		// ownership remain attached to the original prepared statement.
+		auto parent_oracle = ClientConfig::GetConfig(context).native_oracle_active;
+		ScopedConfigSetting oracle_scope(ClientConfig::GetConfig(context), nullptr,
+		    [parent_oracle](ClientConfig &config) { config.native_oracle_active = parent_oracle; });
+		if (parent_oracle) {
+			ClientConfig::GetConfig(context).native_oracle_active =
+			    make_shared_ptr<NativeRowOracle>(*parent_oracle, *relation.base_plan, prepared->relations.size());
+		}
 		prepared->base_plans.push_back(
 		    PlanResultDBYannakakisPhase(context, binder, std::move(relation.base_plan), optimize,
 		                                   relation.preserve_join_order));
+		if (parent_oracle && parent_oracle->discovery) {
+			parent_oracle->internal_physical_plans.push_back(prepared->base_plans.back()->Root().ToString());
+		}
 		prepared->relations.push_back(std::move(relation));
 	}
 	prepared->BuildReductionSchedule();
@@ -832,6 +846,35 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	auto logical_plan = std::move(logical_planner.plan);
 	// extract the result column names from the plan
 	result->properties = logical_planner.properties;
+	// Capture estimates even when parameter binding defers optimization until Execute.
+	if (Settings::Get<ResultdbOptimizerSetting>(*this) == "paper") {
+		result->properties.resultdb.cardinality_snapshot = config.resultdb_cardinalities;
+		result->properties.resultdb.cardinality_dataset = Settings::Get<ResultdbCardinalityDatasetSetting>(*this);
+		result->properties.resultdb.cardinality_load_ms = config.resultdb_cardinality_load_ms;
+	}
+	result->properties.native_statistics_mode = Settings::Get<OptimizerStatisticsModeSetting>(*this);
+	auto discovery = Settings::Get<OptimizerStatisticsDiscoverySetting>(*this);
+	ScopedConfigSetting oracle_scope(config, nullptr, [saved = config.native_oracle_active](ClientConfig &value) {
+		value.native_oracle_active = saved;
+	});
+	config.native_oracle_active.reset();
+	if (statement_type == StatementType::SELECT_STATEMENT &&
+	    (result->properties.native_statistics_mode == "oracle" || discovery)) {
+		auto &resultdb = result->properties.resultdb;
+		bool paper_direct = resultdb.enabled && Settings::Get<ResultdbOptimizerSetting>(*this) == "paper" &&
+		                    (resultdb.requested_strategy == ResultDBStrategy::AUTO ||
+		                     resultdb.requested_strategy == ResultDBStrategy::TDROOT ||
+		                     resultdb.requested_strategy == ResultDBStrategy::TDFOLD ||
+		                     resultdb.requested_strategy == ResultDBStrategy::TDFOLD_NO_TVC);
+		if (!logical_plan || result->properties.parameter_count || !config.enable_optimizer ||
+		    (resultdb.enabled && resultdb.requested_strategy != ResultDBStrategy::DECOMPOSE &&
+		     resultdb.requested_strategy != ResultDBStrategy::SEMIJOIN && !paper_direct)) {
+			throw InvalidInputException("Native row oracle requires parameter-free native plain/decompose or supported direct ResultDB SELECT planning");
+		}
+		result->properties.native_row_oracle = make_shared_ptr<NativeRowOracle>(
+		    *this, *logical_plan, query, config.native_oracle_file, discovery);
+		config.native_oracle_active = result->properties.native_row_oracle;
+	}
 	result->names = logical_planner.names;
 	result->types = logical_planner.types;
 	result->value_map = std::move(logical_planner.value_map);
@@ -878,6 +921,10 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	if (resultdb_yannakakis_program) {
 		result->resultdb_yannakakis_program =
 		    PrepareResultDBYannakakisProgram(*this, *logical_planner.binder, *resultdb_yannakakis_program, optimize);
+	}
+	if (result->properties.native_row_oracle && result->properties.native_row_oracle->requests.empty() &&
+	    logical_plan->type != LogicalOperatorType::LOGICAL_EMPTY_RESULT && !result->resultdb_yannakakis_program) {
+		throw InvalidInputException("Native row oracle received no cardinality requests; check supported query shape and enabled optimization");
 	}
 
 	// Convert the logical query plan into a physical query plan.
@@ -959,6 +1006,46 @@ void ClientContext::RebindPreparedStatement(ClientContextLock &lock, const strin
 		throw InternalException("ClientContext::RebindPreparedStatement called but PreparedStatementData did not have "
 		                        "an unbound statement so rebinding cannot be done");
 	}
+	// A catalog change or deferred parameter binding must not replace a prepared
+	// statement's cardinality snapshot with a later session configuration.
+	struct CardinalitySnapshotGuard {
+		ClientConfig &config;
+		shared_ptr<const ResultDBCardinalityFile> saved;
+		unique_ptr<LocalUserSettings> saved_settings;
+		double saved_load_ms;
+		CardinalitySnapshotGuard(ClientConfig &config_p, const ResultDBProperties &properties)
+		    : config(config_p), saved(config.resultdb_cardinalities),
+		      saved_load_ms(config.resultdb_cardinality_load_ms) {
+			if (properties.cardinality_snapshot) {
+				saved_settings = make_uniq<LocalUserSettings>(config.user_settings);
+				config.user_settings.SetUserSetting(ResultdbCardinalityDatasetSetting::SettingIndex,
+				                                    Value(properties.cardinality_dataset));
+				config.resultdb_cardinalities = properties.cardinality_snapshot;
+				config.resultdb_cardinality_load_ms = properties.cardinality_load_ms;
+			}
+		}
+		~CardinalitySnapshotGuard() {
+			if (saved_settings) {
+				config.resultdb_cardinalities = std::move(saved);
+				config.user_settings = std::move(*saved_settings);
+				config.resultdb_cardinality_load_ms = saved_load_ms;
+			}
+		}
+	} snapshot_guard(config, prepared->properties.resultdb);
+	// Rebinding keeps the original native statistics mode and immutable profile.
+	auto previous_oracle_file = config.native_oracle_file;
+	auto previous_native_mode = Settings::Get<OptimizerStatisticsModeSetting>(*this);
+	auto previous_discovery = Settings::Get<OptimizerStatisticsDiscoverySetting>(*this);
+	ScopedConfigSetting native_snapshot_guard(config, nullptr,
+	    [previous_oracle_file, previous_native_mode, previous_discovery](ClientConfig &value) {
+		    value.native_oracle_file = previous_oracle_file;
+		    value.user_settings.SetUserSetting(OptimizerStatisticsModeSetting::SettingIndex, Value(previous_native_mode));
+		    value.user_settings.SetUserSetting(OptimizerStatisticsDiscoverySetting::SettingIndex, Value(previous_discovery));
+	    });
+	config.user_settings.SetUserSetting(OptimizerStatisticsModeSetting::SettingIndex, Value(prepared->properties.native_statistics_mode));
+	config.user_settings.SetUserSetting(OptimizerStatisticsDiscoverySetting::SettingIndex,
+	    Value(prepared->properties.native_row_oracle && prepared->properties.native_row_oracle->discovery));
+	config.native_oracle_file = prepared->properties.native_row_oracle ? prepared->properties.native_row_oracle->file : nullptr;
 	// catalog was modified: rebind the statement before execution
 	auto new_prepared = CreatePreparedStatement(lock, query, prepared->unbound_statement->Copy(), parameters);
 	D_ASSERT(new_prepared->properties.bound_all_parameters);
@@ -968,6 +1055,9 @@ void ClientContext::RebindPreparedStatement(ClientContextLock &lock, const strin
 }
 
 void ClientContext::CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement) {
+	if (statement.properties.native_row_oracle && statement.properties.native_row_oracle->discovery) {
+		throw InvalidInputException("Native oracle discovery plans cannot execute; count requests offline and prepare in strict oracle mode");
+	}
 	if (ValidChecker::IsInvalidated(ActiveTransaction()) && statement.properties.requires_valid_transaction) {
 		throw ErrorManager::InvalidatedTransaction(*this);
 	}
