@@ -11,7 +11,6 @@
 
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_config.hpp"
-#include "duckdb/optimizer/resultdb_cardinalities.hpp"
 #include <cmath>
 #include <chrono>
 
@@ -1635,29 +1634,6 @@ void ResultdbCostJoinSetting::OnSet(SettingCallbackInfo &, Value &input) { Valid
 void ResultdbCostProbeSetting::OnSet(SettingCallbackInfo &, Value &input) { ValidateResultDBWeight(input); }
 void ResultdbCostBuildSetting::OnSet(SettingCallbackInfo &, Value &input) { ValidateResultDBWeight(input); }
 void ResultdbCostDecomposeSetting::OnSet(SettingCallbackInfo &, Value &input) { ValidateResultDBWeight(input); }
-
-void ResultdbCardinalityFileSetting::SetLocal(ClientContext &context, const Value &input) {
-	auto start = std::chrono::steady_clock::now();
-	auto path = input.GetValue<string>();
-	shared_ptr<const ResultDBCardinalityFile> loaded;
-	if (!path.empty()) {
-		loaded = ResultDBCardinalityFile::Load(context, path);
-	}
-	auto &config = ClientConfig::GetConfig(context);
-	config.resultdb_cardinalities = std::move(loaded);
-	config.resultdb_cardinality_path = std::move(path);
-	config.resultdb_cardinality_load_ms =
-	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-}
-void ResultdbCardinalityFileSetting::ResetLocal(ClientContext &context) {
-	auto &config = ClientConfig::GetConfig(context);
-	config.resultdb_cardinalities.reset();
-	config.resultdb_cardinality_path.clear();
-	config.resultdb_cardinality_load_ms = 0;
-}
-Value ResultdbCardinalityFileSetting::GetSetting(const ClientContext &context) {
-	return Value(ClientConfig::GetConfig(context).resultdb_cardinality_path);
-}
 
 //===----------------------------------------------------------------------===//
 // Schema

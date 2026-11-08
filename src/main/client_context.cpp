@@ -846,12 +846,6 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	auto logical_plan = std::move(logical_planner.plan);
 	// extract the result column names from the plan
 	result->properties = logical_planner.properties;
-	// Capture estimates even when parameter binding defers optimization until Execute.
-	if (Settings::Get<ResultdbOptimizerSetting>(*this) == "paper") {
-		result->properties.resultdb.cardinality_snapshot = config.resultdb_cardinalities;
-		result->properties.resultdb.cardinality_dataset = Settings::Get<ResultdbCardinalityDatasetSetting>(*this);
-		result->properties.resultdb.cardinality_load_ms = config.resultdb_cardinality_load_ms;
-	}
 	result->properties.native_statistics_mode = Settings::Get<OptimizerStatisticsModeSetting>(*this);
 	auto discovery = Settings::Get<OptimizerStatisticsDiscoverySetting>(*this);
 	ScopedConfigSetting oracle_scope(config, nullptr, [saved = config.native_oracle_active](ClientConfig &value) {
@@ -1006,32 +1000,6 @@ void ClientContext::RebindPreparedStatement(ClientContextLock &lock, const strin
 		throw InternalException("ClientContext::RebindPreparedStatement called but PreparedStatementData did not have "
 		                        "an unbound statement so rebinding cannot be done");
 	}
-	// A catalog change or deferred parameter binding must not replace a prepared
-	// statement's cardinality snapshot with a later session configuration.
-	struct CardinalitySnapshotGuard {
-		ClientConfig &config;
-		shared_ptr<const ResultDBCardinalityFile> saved;
-		unique_ptr<LocalUserSettings> saved_settings;
-		double saved_load_ms;
-		CardinalitySnapshotGuard(ClientConfig &config_p, const ResultDBProperties &properties)
-		    : config(config_p), saved(config.resultdb_cardinalities),
-		      saved_load_ms(config.resultdb_cardinality_load_ms) {
-			if (properties.cardinality_snapshot) {
-				saved_settings = make_uniq<LocalUserSettings>(config.user_settings);
-				config.user_settings.SetUserSetting(ResultdbCardinalityDatasetSetting::SettingIndex,
-				                                    Value(properties.cardinality_dataset));
-				config.resultdb_cardinalities = properties.cardinality_snapshot;
-				config.resultdb_cardinality_load_ms = properties.cardinality_load_ms;
-			}
-		}
-		~CardinalitySnapshotGuard() {
-			if (saved_settings) {
-				config.resultdb_cardinalities = std::move(saved);
-				config.user_settings = std::move(*saved_settings);
-				config.resultdb_cardinality_load_ms = saved_load_ms;
-			}
-		}
-	} snapshot_guard(config, prepared->properties.resultdb);
 	// Rebinding keeps the original native statistics mode and immutable profile.
 	auto previous_oracle_file = config.native_oracle_file;
 	auto previous_native_mode = Settings::Get<OptimizerStatisticsModeSetting>(*this);

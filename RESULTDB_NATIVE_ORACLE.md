@@ -52,7 +52,7 @@ normal preparation does not render plan text; the coverage harness captures it
 after preparation, outside benchmark timers. Ordinary helper constant lists
 and runtime reduction state are outside this row-oracle extension.
 
-Local experimental code and data live under `.codex_tmp/resultdb_bench/native_oracle`. Profiles are separate from the Mutable-format paper cardinalities and include database/query fingerprints and counting provenance. Counts may be reused only for identical SQL semantics on the same verified database.
+Current experimental code and data live under local-only `resultdb_benchmarks/`; older scratch artifacts remain in `.codex_tmp`. The native profile is the sole production cardinality-file format, shared by native planning and ResultDB enumeration/internal planning. It includes database/query fingerprints and counting provenance. Counts may be reused only for identical SQL semantics on the same verified database. Historical Mutable-format files remain unchanged as artifacts; their loader and separate configuration have been removed.
 
 ## Reading the implementation
 

@@ -8,7 +8,7 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/planner/resultdb_reduced_plan.hpp"
 #include "duckdb/main/client_config.hpp"
-#include "duckdb/optimizer/resultdb_cardinalities.hpp"
+#include "native_row_oracle_test_helpers.hpp"
 #include "duckdb/common/types/hash.hpp"
 
 #include <algorithm>
@@ -688,26 +688,35 @@ TEST_CASE("Test ResultDB semijoin physical executor handles NULL keys and parall
 }
 
 TEST_CASE("Test ResultDB semijoin reuses fused composite-key phases at T1 and T6", "[api]") {
-	DuckDB db(nullptr);
-	Connection con(db);
+	auto database = TestCreatePath("resultdb_composite_oracle.duckdb");
+	auto profile = TestCreatePath("resultdb_composite_oracle.json");
+	DeleteDatabase(database);
+	{
+		DuckDB writable(database);
+		Connection con(writable);
 
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_a(k1 INTEGER, k2 INTEGER, payload VARCHAR)"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_b(a_k1 INTEGER, a_k2 INTEGER, c_k1 INTEGER, c_k2 INTEGER, "
-	                          "payload BIGINT)"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_c(k1 INTEGER, k2 INTEGER, payload BOOLEAN)"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_a VALUES "
-	                          "(1, 11, 'a-keep'), (1, 11, 'a-keep'), "
-	                          "(2, 22, 'a-no-c'), (3, 33, NULL), (5, 55, NULL), "
-	                          "(4, NULL, 'a-null-key'), (NULL, 55, 'a-null-key')"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_b VALUES "
-	                          "(1, 11, 101, 1001, 1000), (1, 11, 101, 1001, 1000), "
-	                          "(2, 22, 202, 2002, 2000), "
-	                          "(3, 33, 303, 3003, NULL), (5, 55, 505, 5005, NULL), "
-	                          "(4, NULL, 404, 4004, 4000), (NULL, 55, 505, 5005, 5000)"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_c VALUES "
-	                          "(101, 1001, TRUE), (101, 1001, TRUE), "
-	                          "(202, 9999, FALSE), (303, 3003, NULL), (505, 5005, NULL), "
-	                          "(NULL, 5005, TRUE)"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_a(k1 INTEGER, k2 INTEGER, payload VARCHAR)"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_b(a_k1 INTEGER, a_k2 INTEGER, c_k1 INTEGER, c_k2 INTEGER, "
+		                          "payload BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE fused_c(k1 INTEGER, k2 INTEGER, payload BOOLEAN)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_a VALUES "
+		                          "(1, 11, 'a-keep'), (1, 11, 'a-keep'), "
+		                          "(2, 22, 'a-no-c'), (3, 33, NULL), (5, 55, NULL), "
+		                          "(4, NULL, 'a-null-key'), (NULL, 55, 'a-null-key')"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_b VALUES "
+		                          "(1, 11, 101, 1001, 1000), (1, 11, 101, 1001, 1000), "
+		                          "(2, 22, 202, 2002, 2000), "
+		                          "(3, 33, 303, 3003, NULL), (5, 55, 505, 5005, NULL), "
+		                          "(4, NULL, 404, 4004, 4000), (NULL, 55, 505, 5005, 5000)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO fused_c VALUES "
+		                          "(101, 1001, TRUE), (101, 1001, TRUE), "
+		                          "(202, 9999, FALSE), (303, 3003, NULL), (505, 5005, NULL), "
+		                          "(NULL, 5005, TRUE)"));
+	}
+	DBConfig config;
+	config.options.access_mode = AccessMode::READ_ONLY;
+	DuckDB db(database, &config);
+	Connection con(db), counter(db);
 
 	const string from_clause =
 	    " FROM fused_a a "
@@ -724,23 +733,8 @@ TEST_CASE("Test ResultDB semijoin reuses fused composite-key phases at T1 and T6
 	REQUIRE(expected_c->Cast<MaterializedQueryResult>().RowCount() == 2);
 
 	const string resultdb_query = "SELECT RESULTDB a.payload, b.payload, c.payload" + from_clause;
-	// Exact join-bag and semijoin-survivor counts for this composite-key fixture.
-	ClientConfig::GetConfig(*con.context).resultdb_cardinalities = ResultDBCardinalityFile::Parse(R"({"fixture":[
-	  {"relations":["a"],"size":7,"reductions":[
-	    {"right_relations":["b"],"size":5},{"right_relations":["c"],"size":7},
-	    {"right_relations":["b","c"],"size":4}]},
-	  {"relations":["b"],"size":7,"reductions":[
-	    {"right_relations":["a"],"size":5},{"right_relations":["c"],"size":5},
-	    {"right_relations":["a","c"],"size":4}]},
-	  {"relations":["c"],"size":6,"reductions":[
-	    {"right_relations":["a"],"size":6},{"right_relations":["b"],"size":4},
-	    {"right_relations":["a","b"],"size":4}]},
-	  {"relations":["a","b"],"size":7,"reductions":[{"right_relations":["c"],"size":6}]},
-	  {"relations":["a","c"],"size":42,"reductions":[{"right_relations":["b"],"size":6}]},
-	  {"relations":["b","c"],"size":7,"reductions":[{"right_relations":["a"],"size":6}]},
-	  {"relations":["a","b","c"],"size":10}
-	]})");
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_cardinality_dataset='fixture'; SET resultdb_optimizer='paper'"));
+	SealResultDBOracle(con, counter, database, profile, {resultdb_query}, false,
+	                   {"semijoin", "tdroot", "tdfold_no_tvc", "tdfold"});
 	for (auto &strategy : vector<std::pair<string, ResultDBStrategy>> {
 	         {"semijoin", ResultDBStrategy::SEMIJOIN},
 	         {"tdroot", ResultDBStrategy::TDROOT},

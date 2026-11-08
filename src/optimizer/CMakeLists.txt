@@ -37,7 +37,6 @@ add_library_unity(
   join_elimination.cpp
   regex_range_filter.cpp
   resultdb_paper_enumerator.cpp
-  resultdb_cardinalities.cpp
   resultdb_optimizer.cpp
   remove_duplicate_groups.cpp
   remove_unused_columns.cpp

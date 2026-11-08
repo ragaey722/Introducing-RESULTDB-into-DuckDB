@@ -4,7 +4,7 @@
 SQL join planning retain their existing behavior. All direct strategies now share
 one `ResultDBOptimizer` with graph-capture and execution-planning phases.
 The previous simplified root/fold enumerator has been removed. TDRoot, TDFold-NoTVC,
-TDFold and AUTO enumeration require paper mode and injected cardinalities.
+TDFold and AUTO enumeration require paper mode and a native row-oracle profile.
 Outside paper mode, `auto` selects ordinary decompose without enumeration; explicit
 root/fold strategies report a configuration error. The `legacy` setting remains
 for compatibility and the baseline paths; it no longer selects an old enumerator.
@@ -12,8 +12,8 @@ for compatibility and the baseline paths; it no longer selects an old enumerator
 ## Configuration
 
 ```sql
-SET resultdb_cardinality_file = '/absolute/path/query_cardinalities.json';
-SET resultdb_cardinality_dataset = 'job';
+SET optimizer_statistics_file = '/absolute/path/native_oracle.json';
+SET optimizer_statistics_mode = 'oracle';
 SET resultdb_optimizer = 'paper';
 SET resultdb_strategy = 'tdfold';
 SELECT RESULTDB a.id, b.id FROM a, b WHERE a.id = b.id;
@@ -61,44 +61,27 @@ bindings. Original equality edges remain authoritative for direct enumeration.
 Reduction requests count left-bag survivors with EXISTS, preserving multiplicity;
 they do not count DISTINCT public outputs. Diagnostic COUNT/EXISTS SQL is only an
 offline request identity and is never executed by native planning or execution.
-No Mutable-format cardinality file is needed for this configuration. Explicit
-tdroot/tdfold_no_tvc/tdfold can use the same native oracle mode and input semantics.
+All enumerated strategies use this native oracle mode and input semantics.
+The older Mutable-format loader and its separate file/dataset settings have been removed.
 
 Missing counts fail preparation with the exact key, stage and count request.
 Discovery alone permits estimates and cannot execute. Profiles require separately
 generated coverage; old native-decompose profiles generally lack reduction
 requests. Empty-result proofs still come from logical rules, never injected zeros.
 
-Mutable-format files remain available for paper-cost fixtures and explicit direct
-strategies. Their original local-filter scope must not be presented as validated
-optimized-input counts. Historical AUTO measurements use
-the previous competitor and cannot be pooled with this adaptation.
+The native profile is loaded and validated atomically at SET time. Failed SETs
+retain the previous snapshot. RESET releases the connection's snapshot; existing
+prepared statements retain theirs, including on rebind. The profile identifies
+requests by query, schema and count-request fingerprints and validates the frozen
+database identity. See [RESULTDB_NATIVE_ORACLE.md](RESULTDB_NATIVE_ORACLE.md) for
+the native profile and discovery workflow.
 
-The file setting parses and validates the entire file once, atomically, at SET
-time. Failed SETs retain the previous snapshot. RESET releases the connection's
-snapshot; existing prepared plans retain theirs. Use one query-specific file and
-an explicit dataset key. Aliases are occurrence identities, including self-joins
-and relations that are only used for filtering. File aliases must match the
-bound query aliases. File contents are not refreshed automatically.
-
-Mutable's schema is accepted directly:
-
-```json
-{"job": [
-  {"relations": ["a"], "size": 100,
-   "reductions": [{"right_relations": ["b"], "size": 5}]},
-  {"relations": ["b"], "size": 10,
-   "reductions": [{"right_relations": ["a"], "size": 7}]},
-  {"relations": ["a", "b"], "size": 12}
-]}
-```
-
-Sizes describe filtered base bags, intermediate join bags, or surviving left bag
-rows of a semijoin. They are not counts of distinct public output projections.
-Every requested estimate must be present. Missing estimates, malformed JSON,
-conflicting duplicate entries, negative/nonfinite sizes, overlapping reduction
-sets, and reductions exceeding their unreduced size are errors. The optimizer
-never runs counting SQL and never uses estimates to prove a result empty.
+Counts describe raw/filtered bags, join bags, surviving left-bag rows after
+existential reductions, or internal working-tuple DISTINCT outputs. These are
+different quantities. Missing requested counts fail strict preparation; no
+runtime counting or estimated fallback occurs. Injected zeros never prove a
+result empty. Historical Mutable-format files and measurements remain local
+artifacts; they are no longer accepted as current optimizer inputs.
 
 ## Algorithms and costs
 
@@ -144,11 +127,9 @@ the previous implementation and must not be relabeled as results for this one.
 The `legacy`/`paper` setting remains a compatibility/configuration gate for
 enumerated strategies; it no longer denotes a separate optimizer object or phase.
 
-Mutable-format cardinalities retain their original local-filter scope; they do
-not establish exact optimized-input counts. The separate native oracle profile
-now supplies those counts for paper direct strategies and AUTO as described above.
-No transformed-input counts are manufactured from old estimates, and no runtime
-counting is performed.
+The native oracle supplies counts for the actual optimized inputs, including
+propagated filters. Historical Mutable-format counts have a different scope and
+are not substituted for these requests. No runtime counting is performed.
 
 Subplan optimization may simplify expressions and choose physical operators;
 join re-enumeration is disabled for selected folded join trees. Build/probe
@@ -204,13 +185,14 @@ available. Tests cover strict loading, snapshot lifetime, aliases, zero
 estimates, graph preservation, schedules, exhaustive small-tree root choices,
 connected fold partitions, and recursive TVCs.
 
-Experiment tools and data are local-only under `.codex_tmp/resultdb_bench`.
+Current experiment tools and data are local-only under `resultdb_benchmarks/`;
+older scratch artifacts remain in `.codex_tmp`.
 Reference cardinalities and newly generated primary33 cardinalities are separate
 tracks. Supplied files are planning fixtures until the corresponding prefiltered
 data is verified. The reference q23a acyclic file contains missing numeric values.
 No supplied file is repaired in place.
 
-Diagnostics retain the snapshot SHA-256, dataset key, weights, chosen join trees,
+Diagnostics retain the native profile SHA-256, input-scope label, weights, chosen join trees,
 reduction schedule, cost components, lookup count, and enumeration work. Cardinality
 loading is timed separately from Prepare. Enumeration time is included in Prepare,
 not added to total a second time. Local result retrieval is neither network

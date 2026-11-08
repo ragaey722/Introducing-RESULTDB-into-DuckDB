@@ -16,7 +16,6 @@
 #include "duckdb/common/enums/database_modification_type.hpp"
 
 namespace duckdb {
-class ResultDBCardinalityFile;
 class NativeRowOracle;
 
 //===--------------------------------------------------------------------===//
@@ -116,7 +115,6 @@ struct ResultDBProperties {
 	bool paper_planned = false;
 	bool planning_phase = false;
 	unordered_map<idx_t, string> occurrence_aliases;
-	shared_ptr<const ResultDBCardinalityFile> cardinality_snapshot;
 	string cardinality_sha256;
 	string cardinality_dataset;
 	string optimizer_mode;

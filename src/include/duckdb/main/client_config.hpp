@@ -25,7 +25,6 @@ namespace duckdb {
 class ClientContext;
 class PhysicalResultCollector;
 class PreparedStatementData;
-class ResultDBCardinalityFile;
 class NativeRowOracleFile;
 class NativeRowOracle;
 
@@ -37,9 +36,6 @@ struct ClientConfig {
 	shared_ptr<NativeRowOracle> native_oracle_active;
 	string native_oracle_path;
 	double native_oracle_load_ms = 0;
-	shared_ptr<const ResultDBCardinalityFile> resultdb_cardinalities;
-	string resultdb_cardinality_path;
-	double resultdb_cardinality_load_ms = 0;
 	//! If the query profiler is enabled or not.
 	bool enable_profiler = false;
 	//! If detailed query profiling is enabled

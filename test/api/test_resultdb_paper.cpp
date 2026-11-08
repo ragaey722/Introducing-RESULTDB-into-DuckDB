@@ -2,12 +2,12 @@
 #include "test_helpers.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
-#include "duckdb/optimizer/resultdb_cardinalities.hpp"
+#include "duckdb/optimizer/resultdb_plan_enumerator.hpp"
+#include "native_row_oracle_test_helpers.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 
 #include <algorithm>
-#include <fstream>
 #include <functional>
 #include <cmath>
 #include <set>
@@ -18,38 +18,23 @@ namespace {
 using Mask = uint64_t;
 using CardFunction = std::function<double(Mask, Mask)>;
 
-static string PaperCards(const vector<string> &aliases, const CardFunction &card) {
-	auto names = [&](Mask subset) {
-		string result = "[";
-		for (idx_t i = 0; i < aliases.size(); i++) {
-			if (subset & (Mask(1) << i)) {
-				if (result.size() > 1) {
-					result += ",";
-				}
-				result += "\"" + aliases[i] + "\"";
-			}
-		}
-		return result + "]";
-	};
-	string json = "{\"fixture\":[";
-	auto all = (Mask(1) << aliases.size()) - 1;
-	for (Mask left = 1; left <= all; left++) {
-		if (left > 1) {
-			json += ",";
-		}
-		json += "{\"relations\":" + names(left) + ",\"size\":" + std::to_string(card(left, 0)) + ",\"reductions\":[";
-		bool first = true;
-		for (auto right = all ^ left; right; right = (right - 1) & (all ^ left)) {
-			if (!first) {
-				json += ",";
-			}
-			first = false;
-			json += "{\"right_relations\":" + names(right) + ",\"size\":" + std::to_string(card(left, right)) + "}";
-		}
-		json += "]}";
+// Algorithm fixtures supply numbers directly; no file format is involved.
+class PaperTestCardinalities : public ResultDBEnumerationCostProvider {
+public:
+	explicit PaperTestCardinalities(CardFunction card_p) : card(std::move(card_p)) {
 	}
-	return json + "]}";
-}
+	double Cardinality(const vector<idx_t> &nodes) override {
+		Mask mask = 0;
+		for (auto node : nodes) { mask |= Mask(1) << node; }
+		return card(mask, 0);
+	}
+	double ReducedCardinality(Mask left, Mask right) override { return card(left, right); }
+	double PayloadWidth(const vector<idx_t> &) override {
+		throw InternalException("Paper fixture costs do not use payload width");
+	}
+private:
+	CardFunction card;
+};
 
 static ResultDBEnumerationInput PaperGraph(idx_t n, const vector<ResultDBEnumerationEdge> &edges, Mask requested) {
 	ResultDBEnumerationInput graph;
@@ -76,13 +61,6 @@ static std::multiset<string> PaperRows(QueryResult &result) {
 	return rows;
 }
 
-static void InstallPaperCards(Connection &con, const vector<string> &aliases, double value = 10) {
-	ClientConfig::GetConfig(*con.context).resultdb_cardinalities =
-	    ResultDBCardinalityFile::Parse(PaperCards(aliases, [=](Mask, Mask) { return value; }));
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_cardinality_dataset='fixture'"));
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_optimizer='paper'"));
-}
-
 static idx_t ScansWithFiveFilter(PhysicalOperator &op) {
 	idx_t count = 0;
 	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
@@ -105,48 +83,27 @@ static idx_t ScansWithFiveFilter(PhysicalOperator &op) {
 
 TEST_CASE("ResultDB strategies share graph capture and whole-query filter propagation",
           "[api][resultdb][resultdb_paper]") {
-	DuckDB db(nullptr);
-	Connection con(db);
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE a(k INTEGER); INSERT INTO a VALUES (5),(5),(7),(NULL);"
-	                          "CREATE TABLE b(k INTEGER); INSERT INTO b VALUES (5),(5),(7),(8),(NULL);"
-	                          "CREATE TABLE c(k INTEGER); INSERT INTO c VALUES (5),(5),(7),(9),(NULL)"));
+	auto database = TestCreatePath("paper_graph_filters.duckdb");
+	auto profile = TestCreatePath("paper_graph_filters.json");
+	DeleteDatabase(database);
+	{
+		DuckDB writable(database);
+		Connection con(writable);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE a(k INTEGER); INSERT INTO a VALUES (5),(5),(7),(NULL);"
+		                          "CREATE TABLE b(k INTEGER); INSERT INTO b VALUES (5),(5),(7),(8),(NULL);"
+		                          "CREATE TABLE c(k INTEGER); INSERT INTO c VALUES (5),(5),(7),(9),(NULL)"));
+	}
+	DBConfig config;
+	config.options.access_mode = AccessMode::READ_ONLY;
+	DuckDB db(database, &config);
+	Connection con(db), counter(db);
+
 	const string from = " FROM a,b,c WHERE a.k=b.k AND b.k=c.k AND a.k=5";
 	auto expected = con.Query("SELECT DISTINCT a.k" + from);
 	REQUIRE_NO_FAIL(*expected);
 	auto rows = PaperRows(*expected);
-	// Independently count bags/survivors of the original filtered graph. The
-	// propagated B/C scan inputs are smaller; the paper model retains its scope.
-	auto json = PaperCards({"a", "b", "c"}, [&](Mask left, Mask right) {
-		auto tables = [](Mask mask) {
-			string out;
-			for (idx_t i = 0; i < 3; i++) {
-				if (mask & (Mask(1) << i)) {
-					if (!out.empty()) { out += ","; }
-					out += string(1, char('a' + i));
-				}
-			}
-			return out;
-		};
-		auto predicates = [](Mask mask, Mask outside) {
-			string out = "TRUE";
-			if (mask & 1) { out += " AND a.k=5"; }
-			for (auto edge : {Mask(3), Mask(6)}) {
-				if (((mask | outside) & edge) == edge && (mask & edge)) {
-					out += edge == 3 ? " AND a.k=b.k" : " AND b.k=c.k";
-				}
-			}
-			return out;
-		};
-		string sql = "SELECT COUNT(*) FROM " + tables(left) + " WHERE " + predicates(left, 0);
-		if (right) {
-			sql += " AND EXISTS (SELECT 1 FROM " + tables(right) + " WHERE " + predicates(right, left) + ")";
-		}
-		auto count = con.Query(sql);
-		REQUIRE_NO_FAIL(*count);
-		return count->GetValue(0, 0).GetValue<double>();
-	});
-	ClientConfig::GetConfig(*con.context).resultdb_cardinalities = ResultDBCardinalityFile::Parse(json);
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_optimizer='paper'; SET resultdb_cardinality_dataset='fixture'"));
+	SealResultDBOracle(con, counter, database, profile, {"SELECT RESULTDB a.k,b.k,c.k" + from}, false,
+	                   {"semijoin", "tdroot", "tdfold_no_tvc", "tdfold"});
 	for (auto strategy : {"semijoin", "tdroot", "tdfold_no_tvc", "tdfold"}) {
 		REQUIRE_NO_FAIL(con.Query(string("SET resultdb_strategy='") + strategy + "'"));
 		auto prepared = con.Prepare("SELECT RESULTDB a.k,b.k,c.k" + from);
@@ -178,15 +135,28 @@ TEST_CASE("ResultDB strategies share graph capture and whole-query filter propag
 
 TEST_CASE("ResultDB shared capture retains original cycles and handles proven empty inputs",
           "[api][resultdb][resultdb_paper]") {
-	DuckDB db(nullptr);
-	Connection con(db);
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(k INTEGER, note VARCHAR); "
-	                          "INSERT INTO t VALUES (5,'x'),(5,'x'),(7,NULL),(NULL,'n')"));
-	InstallPaperCards(con, {"a", "b", "c"}, 0); // Estimates cannot prove emptiness.
+	auto database = TestCreatePath("paper_cycle_empty.duckdb");
+	auto profile = TestCreatePath("paper_cycle_empty.json");
+	DeleteDatabase(database);
+	{
+		DuckDB writable(database);
+		Connection con(writable);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(k INTEGER, note VARCHAR); "
+		                          "INSERT INTO t VALUES (5,'x'),(5,'x'),(7,NULL),(NULL,'n')"));
+	}
+	DBConfig config;
+	config.options.access_mode = AccessMode::READ_ONLY;
+	DuckDB db(database, &config);
+	Connection con(db), counter(db);
+
 	const string from = " FROM t a,t b,t c WHERE a.k=b.k AND b.k=c.k AND a.k=c.k AND a.k=5";
 	auto expected = con.Query("SELECT DISTINCT a.note" + from);
 	REQUIRE_NO_FAIL(*expected);
 	auto rows = PaperRows(*expected);
+	SealResultDBOracle(con, counter, database, profile,
+	                   {"SELECT RESULTDB a.note,c.note" + from,
+	                    "SELECT RESULTDB a.note,c.note" + from + " AND a.k=7"}, true,
+	                   {"semijoin", "tdfold_no_tvc", "tdfold"});
 	for (auto strategy : {"semijoin", "tdfold_no_tvc", "tdfold"}) {
 		REQUIRE_NO_FAIL(con.Query(string("SET resultdb_strategy='") + strategy + "'"));
 		auto result = con.Query("SELECT RESULTDB a.note,c.note" + from);
@@ -209,30 +179,10 @@ TEST_CASE("ResultDB shared capture retains original cycles and handles proven em
 	REQUIRE_FAIL(con.Query("SELECT RESULTDB a.note" + from + " AND FALSE"));
 }
 
-TEST_CASE("Paper ResultDB strict cardinality parsing and occurrence identity", "[api][resultdb][resultdb_paper]") {
-	for (auto json :
-	     {"{}garbage", "{\"d\":[{\"relations\":[\"a\"],\"size\":}]}", "{\"d\":[{\"relations\":[\"a\"],\"size\":-1}]}",
-	      "{\"d\":[{\"relations\":[\"a\",\"a\"],\"size\":1}]}",
-	      "{\"d\":[{\"relations\":[\"a\"],\"size\":1,\"size\":2}]}",
-	      "{\"d\":[{\"relations\":[\"a\"],\"size\":1},{\"relations\":[\"a\"],\"size\":2}]}",
-	      "{\"d\":[{\"relations\":[\"a\"],\"size\":1,\"reductions\":[{\"right_relations\":[\"a\"],\"size\":1}]}]}"}) {
-		REQUIRE_THROWS(ResultDBCardinalityFile::Parse(json));
-	}
-	auto file = ResultDBCardinalityFile::Parse("{\"d\":[{\"relations\":[\"a\"],\"size\":7}]}");
-	REQUIRE(file->sha256.size() == 64);
-	ResultDBInjectedCardinalities cards(file, "d", {"b", "a"});
-	REQUIRE(cards.ReducedCardinality(2, 0) == 7);
-	REQUIRE_THROWS_WITH(cards.ReducedCardinality(1, 2), Catch::Contains("relations=[b], right_relations=[a]"));
-	REQUIRE_THROWS(ResultDBInjectedCardinalities(file, "missing", {"a"}));
-	REQUIRE_THROWS(ResultDBInjectedCardinalities(file, "d", {"x"}));
-	REQUIRE_THROWS(ResultDBInjectedCardinalities(file, "d", {"a", "a"}));
-}
-
 TEST_CASE("Paper TDRoot charges the root top-down pass and considers unrequested roots",
           "[api][resultdb][resultdb_paper]") {
-	auto json = PaperCards(
-	    {"a", "b"}, [](Mask left, Mask right) { return left == 1 ? (right ? 5.0 : 100.0) : (right ? 7.0 : 10.0); });
-	ResultDBInjectedCardinalities cards(ResultDBCardinalityFile::Parse(json), "fixture", {"a", "b"});
+	CardFunction card = [](Mask left, Mask right) { return left == 1 ? (right ? 5.0 : 100.0) : (right ? 7.0 : 10.0); };
+	PaperTestCardinalities cards(card);
 	auto input = PaperGraph(2, {{0, 1}}, 2);
 	auto plan = ResultDBPlanEnumerator::EnumeratePaperRoot(input, cards, {});
 	REQUIRE(plan.root == 0);
@@ -249,13 +199,13 @@ TEST_CASE("Paper TDRoot charges the root top-down pass and considers unrequested
 }
 
 TEST_CASE("Paper TDRoot orders reductions by parent selectivity", "[api][resultdb][resultdb_paper]") {
-	auto json = PaperCards({"a", "b", "c"}, [](Mask left, Mask right) {
+	CardFunction card = [](Mask left, Mask right) {
 		if (left == 1) {
 			return right == 6 ? 0.0 : right == 4 ? 10.0 : right == 2 ? 500.0 : 1000.0;
 		}
 		return left == 2 ? 20.0 : 200.0;
-	});
-	ResultDBInjectedCardinalities cards(ResultDBCardinalityFile::Parse(json), "fixture", {"a", "b", "c"});
+	};
+	PaperTestCardinalities cards(card);
 	auto plan = ResultDBPlanEnumerator::EnumeratePaperRoot(PaperGraph(3, {{0, 1}, {0, 2}}, 7), cards, {});
 	REQUIRE(plan.root == 0);
 	REQUIRE(plan.bottom_up_children[0] == vector<idx_t> {2, 1});
@@ -279,7 +229,6 @@ TEST_CASE("Paper TDRoot agrees with an independent all-roots schedule oracle", "
 		}
 		return count;
 	};
-	auto file = ResultDBCardinalityFile::Parse(PaperCards({"a", "b", "c", "d"}, card));
 	idx_t checked = 0;
 	for (Mask selected = 1; selected < (Mask(1) << possible.size()); selected++) {
 		vector<ResultDBEnumerationEdge> edges;
@@ -349,7 +298,7 @@ TEST_CASE("Paper TDRoot agrees with an independent all-roots schedule oracle", "
 					best_root = root;
 				}
 			}
-			ResultDBInjectedCardinalities cards(file, "fixture", {"a", "b", "c", "d"});
+			PaperTestCardinalities cards(card);
 			auto actual = ResultDBPlanEnumerator::EnumeratePaperRoot(PaperGraph(n, edges, requested), cards, {});
 			REQUIRE(actual.cost == Approx(best).epsilon(0.00001));
 			REQUIRE(actual.root == best_root);
@@ -361,15 +310,13 @@ TEST_CASE("Paper TDRoot agrees with an independent all-roots schedule oracle", "
 
 TEST_CASE("Paper TDFold preserves original occurrences through blocks and recursive TVCs",
           "[api][resultdb][resultdb_paper]") {
-	vector<string> aliases {"a", "b", "c", "d", "e", "f"};
-	auto file = ResultDBCardinalityFile::Parse(
-	    PaperCards(aliases, [](Mask left, Mask) { return (left & (left - 1)) == 0 ? 1.0 : 1000.0; }));
+	CardFunction card = [](Mask left, Mask) { return (left & (left - 1)) == 0 ? 1.0 : 1000.0; };
 	vector<vector<ResultDBEnumerationEdge>> graphs {{{0, 1}, {1, 2}, {2, 0}, {2, 3}, {3, 4}, {4, 2}, {4, 5}},
 	                                                {{0, 1}, {1, 2}, {2, 3}, {3, 4}, {4, 5}, {5, 0}, {1, 4}},
 	                                                {{0, 1}, {1, 2}, {2, 0}, {2, 3}, {3, 4}, {4, 5}, {5, 3}}};
 	for (auto &edges : graphs) {
 		for (bool tvc : {false, true}) {
-			ResultDBInjectedCardinalities cards(file, "fixture", aliases);
+			PaperTestCardinalities cards(card);
 			auto input = PaperGraph(6, edges, 63);
 			auto result = ResultDBPlanEnumerator::EnumeratePaper(input, cards, {}, tvc);
 			REQUIRE(result.valid);
@@ -422,7 +369,6 @@ TEST_CASE("Paper SC1F and SC2F agree with exhaustive connected-partition costing
 			CardFunction card = [&](Mask left, Mask) {
 				return exponential ? std::pow(10.0, count(left)) : 100.0;
 			};
-			auto file = ResultDBCardinalityFile::Parse(PaperCards({"a", "b", "c", "d"}, card));
 			// Independent bottom-up DP over every bit subset, not the production connected-set traversal.
 			vector<double> joins(16, std::numeric_limits<double>::infinity());
 			for (Mask subset = 1; subset < 16; subset++) {
@@ -460,7 +406,7 @@ TEST_CASE("Paper SC1F and SC2F agree with exhaustive connected-partition costing
 						expected = folds;
 					}
 				}
-				ResultDBInjectedCardinalities cards(file, "fixture", {"a", "b", "c", "d"});
+				PaperTestCardinalities cards(card);
 				auto actual =
 				    ResultDBPlanEnumerator::EnumeratePaper(PaperGraph(4, edges, requested), cards, {}, false);
 				vector<Mask> folds;
@@ -485,14 +431,13 @@ TEST_CASE("Paper SC1F and SC2F agree with exhaustive connected-partition costing
 
 TEST_CASE("Paper recursive TVC candidate can beat one-fold and two-fold candidates",
           "[api][resultdb][resultdb_paper]") {
-	vector<string> aliases {"a", "b", "c", "d", "e", "f"};
-	auto file = ResultDBCardinalityFile::Parse(PaperCards(aliases, [](Mask left, Mask) {
+	CardFunction card = [](Mask left, Mask) {
 		double result = 1;
 		for (; left; left &= left - 1)
 			result *= 10;
 		return result;
-	}));
-	ResultDBInjectedCardinalities cards(file, "fixture", aliases);
+	};
+	PaperTestCardinalities cards(card);
 	auto graph = PaperGraph(6, {{0, 1}, {1, 2}, {2, 3}, {3, 4}, {4, 5}, {5, 0}, {1, 4}}, 63);
 	auto no_tvc = ResultDBPlanEnumerator::EnumeratePaper(graph, cards, {}, false);
 	auto tvc = ResultDBPlanEnumerator::EnumeratePaper(graph, cards, {}, true);
@@ -504,12 +449,22 @@ TEST_CASE("Paper recursive TVC candidate can beat one-fold and two-fold candidat
 
 TEST_CASE("Paper ResultDB native execution preserves cycles, predicates and output semantics",
           "[api][resultdb][resultdb_paper]") {
-	DuckDB db(nullptr);
-	Connection con(db);
-	REQUIRE_NO_FAIL(
-	    con.Query("CREATE TABLE a(id INTEGER, note VARCHAR); INSERT INTO a VALUES (1,'x'),(1,'x'),(2,NULL),(NULL,'n');"
-	              "CREATE TABLE b(id BIGINT); INSERT INTO b VALUES (1),(1),(2),(3),(NULL);"
-	              "CREATE TABLE c(id INTEGER); INSERT INTO c VALUES (1),(2),(NULL)"));
+	auto database = TestCreatePath("paper_execution.duckdb");
+	auto profile = TestCreatePath("paper_execution.json");
+	DeleteDatabase(database);
+	{
+		DuckDB writable(database);
+		Connection con(writable);
+		REQUIRE_NO_FAIL(
+		    con.Query("CREATE TABLE a(id INTEGER, note VARCHAR); INSERT INTO a VALUES (1,'x'),(1,'x'),(2,NULL),(NULL,'n');"
+		              "CREATE TABLE b(id BIGINT); INSERT INTO b VALUES (1),(1),(2),(3),(NULL);"
+		              "CREATE TABLE c(id INTEGER); INSERT INTO c VALUES (1),(2),(NULL); CREATE TABLE empty_c(id INTEGER)"));
+	}
+	DBConfig config;
+	config.options.access_mode = AccessMode::READ_ONLY;
+	DuckDB db(database, &config);
+	Connection con(db), counter(db);
+
 	auto from =
 	    " FROM a,b,c WHERE CAST(a.id AS BIGINT)=b.id AND b.id=c.id AND a.id=c.id AND (a.note='x' OR a.note IS NULL)";
 	auto expected_a = con.Query(string("SELECT DISTINCT a.id,a.note") + from);
@@ -521,7 +476,9 @@ TEST_CASE("Paper ResultDB native execution preserves cycles, predicates and outp
 	auto rows_b = PaperRows(*expected_b);
 	REQUIRE_NO_FAIL(*expected_plain);
 	auto rows_plain = PaperRows(*expected_plain);
-	InstallPaperCards(con, {"a", "b", "c"}, 0); // Wrong zeros must affect planning only.
+	SealResultDBOracle(con, counter, database, profile,
+	                   {string("SELECT RESULTDB a.id,a.note,b.id") + from}, true,
+	                   {"tdfold_no_tvc", "tdfold"}); // Wrong zeros affect planning only.
 	for (auto strategy : {"tdfold_no_tvc", "tdfold"}) {
 		REQUIRE_NO_FAIL(con.Query(string("SET resultdb_strategy='") + strategy + "'"));
 		auto result = con.Query(string("SELECT RESULTDB a.id,a.note,b.id") + from);
@@ -538,11 +495,12 @@ TEST_CASE("Paper ResultDB native execution preserves cycles, predicates and outp
 	}
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='tdroot'"));
 	REQUIRE_FAIL(con.Query(string("SELECT RESULTDB a.id") + from));
+	SealResultDBOracle(con, counter, database, profile, {"SELECT RESULTDB a.id FROM a,b,c WHERE CAST(a.id AS BIGINT)=b.id AND b.id=c.id"}, false, {"tdroot"});
 	auto tree = con.Query("SELECT RESULTDB a.id FROM a,b,c WHERE CAST(a.id AS BIGINT)=b.id AND b.id=c.id");
 	REQUIRE_NO_FAIL(*tree);
 	REQUIRE(tree->properties.resultdb.join_edges.size() == 2);
 	REQUIRE_FAIL(con.Query("SET resultdb_join_planner='cout'")); // Retired planner option.
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='decompose'"));
+	REQUIRE_NO_FAIL(con.Query("SET optimizer_statistics_mode='estimated'; SET resultdb_strategy='decompose'"));
 	auto plain = con.Query(string("SELECT a.id,a.note,b.id") + from);
 	REQUIRE_NO_FAIL(*plain);
 	REQUIRE(!plain->properties.resultdb.paper_planned);
@@ -554,8 +512,10 @@ TEST_CASE("Paper ResultDB native execution preserves cycles, predicates and outp
 	REQUIRE(ordinary->next);
 	REQUIRE(PaperRows(*ordinary->next) == rows_b);
 	REQUIRE(!ordinary->next->next);
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='tdfold'; DELETE FROM c"));
-	auto empty = con.Query(string("SELECT RESULTDB a.id,a.note,b.id") + from);
+	auto empty_query = string("SELECT RESULTDB a.id,a.note,b.id") +
+	                   " FROM a,b,empty_c c WHERE CAST(a.id AS BIGINT)=b.id AND b.id=c.id AND a.id=c.id";
+	SealResultDBOracle(con, counter, database, profile, {empty_query}, false, {"tdfold"});
+	auto empty = con.Query(empty_query);
 	REQUIRE_NO_FAIL(*empty);
 	REQUIRE(PaperRows(*empty).empty());
 	REQUIRE(empty->next);
@@ -563,52 +523,6 @@ TEST_CASE("Paper ResultDB native execution preserves cycles, predicates and outp
 	REQUIRE(empty->next->types == vector<LogicalType> {LogicalType::BIGINT});
 	REQUIRE(PaperRows(*empty->next).empty());
 	REQUIRE(!empty->next->next);
-}
-
-TEST_CASE("Paper ResultDB settings load atomically and prepared queries retain the snapshot",
-          "[api][resultdb][resultdb_paper]") {
-	DuckDB db(nullptr);
-	Connection con(db);
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1),(1),(2),(NULL)"));
-	auto path = TestCreatePath("resultdb_paper_cardinalities.json");
-	{
-		std::ofstream out(path);
-		out << PaperCards({"employee", "manager"}, [](Mask, Mask) { return 4.0; });
-	}
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_cardinality_file='" + path + "'"));
-	REQUIRE_NO_FAIL(con.Query(
-	    "SET resultdb_cardinality_dataset='fixture'; SET resultdb_optimizer='paper'; SET resultdb_strategy='tdroot'"));
-	auto prepared =
-	    con.Prepare("SELECT RESULTDB employee.id,manager.id FROM t employee,t manager WHERE employee.id=manager.id");
-	REQUIRE(!prepared->HasError());
-	auto snapshot = prepared->data->properties.resultdb.cardinality_snapshot;
-	auto parameterized = con.Prepare("SELECT RESULTDB employee.id FROM t employee,t manager "
-	                                 "WHERE employee.id=manager.id AND employee.id=$1");
-	REQUIRE(!parameterized->HasError());
-	{
-		std::ofstream out(path);
-		out << "invalid JSON";
-	}
-	REQUIRE_FAIL(con.Query("SET resultdb_cardinality_file='" + path + "'"));
-	REQUIRE(ClientConfig::GetConfig(*con.context).resultdb_cardinalities == snapshot);
-	REQUIRE_NO_FAIL(con.Query("RESET resultdb_cardinality_file"));
-	auto result = prepared->Execute();
-	REQUIRE_NO_FAIL(*result);
-	REQUIRE(result->properties.resultdb.cardinality_snapshot == snapshot);
-	REQUIRE(result->next);
-	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE force_catalog_rebind(i INTEGER)"));
-	auto rebound = prepared->Execute();
-	REQUIRE_NO_FAIL(*rebound);
-	REQUIRE(rebound->properties.resultdb.cardinality_snapshot == snapshot);
-	auto parameter_result = parameterized->Execute(1);
-	REQUIRE_NO_FAIL(*parameter_result);
-	REQUIRE(parameter_result->properties.resultdb.cardinality_snapshot == snapshot);
-	REQUIRE(parameter_result->Cast<MaterializedQueryResult>().RowCount() == 1);
-	REQUIRE(!ClientConfig::GetConfig(*con.context).resultdb_cardinalities);
-	REQUIRE_FAIL(con.Query("SELECT RESULTDB employee.id FROM t employee,t manager WHERE employee.id=manager.id"));
-	REQUIRE_FAIL(con.Query("SET resultdb_cost_build=0"));
-	REQUIRE_FAIL(con.Query("SET resultdb_optimizer='unknown'"));
 }
 
 TEST_CASE("Paper ResultDB executes against a reopened persistent database", "[api][resultdb][resultdb_paper]") {
@@ -623,8 +537,10 @@ TEST_CASE("Paper ResultDB executes against a reopened persistent database", "[ap
 		DBConfig config;
 		config.options.access_mode = AccessMode::READ_ONLY;
 		DuckDB db(path, &config);
-		Connection con(db);
-		InstallPaperCards(con, {"a", "b"});
+		Connection con(db), counter(db);
+		auto profile = TestCreatePath("resultdb_paper_persistent.json");
+		SealResultDBOracle(con, counter, path, profile,
+		                   {"SELECT RESULTDB a.i,b.i FROM a,b WHERE a.i=b.i"}, false, {"tdroot"});
 		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='tdroot'"));
 		auto result = con.Query("SELECT RESULTDB a.i,b.i FROM a,b WHERE a.i=b.i");
 		REQUIRE_NO_FAIL(*result);
@@ -636,16 +552,20 @@ TEST_CASE("Paper ResultDB executes against a reopened persistent database", "[ap
 }
 
 
-TEST_CASE("Paper AUTO rejects historical C_out cardinalities without a native oracle",
+TEST_CASE("Paper strategies require a native row oracle",
           "[api][resultdb][resultdb_paper]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE narrow_a(k BOOLEAN); CREATE TABLE narrow_b(k BOOLEAN)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO narrow_a VALUES (TRUE), (FALSE); "
 	                          "INSERT INTO narrow_b VALUES (TRUE), (FALSE)"));
-	InstallPaperCards(con, {"a", "b"}, 2);
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='auto'"));
-	auto result = con.Query("SELECT RESULTDB * FROM narrow_a a JOIN narrow_b b ON a.k=b.k");
-	REQUIRE_FAIL(result);
-	REQUIRE(result->GetError().find("native row oracle") != string::npos);
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_optimizer='paper'"));
+	for (auto strategy : {"tdroot", "tdfold_no_tvc", "tdfold", "auto"}) {
+		REQUIRE_NO_FAIL(con.Query(string("SET resultdb_strategy='") + strategy + "'"));
+		auto result = con.Query("SELECT RESULTDB * FROM narrow_a a JOIN narrow_b b ON a.k=b.k");
+		REQUIRE_FAIL(result);
+		REQUIRE(result->GetError().find("native row oracle") != string::npos);
+	}
+	REQUIRE_FAIL(con.Query("SET resultdb_cost_build=0"));
+	REQUIRE_FAIL(con.Query("SET resultdb_optimizer='unknown'"));
 }

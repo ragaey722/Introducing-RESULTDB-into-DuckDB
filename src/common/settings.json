@@ -1090,20 +1090,6 @@
         "custom_implementation": true
     },
     {
-        "name": "resultdb_cardinality_dataset",
-        "description": "Dataset key in the ResultDB cardinality JSON file",
-        "type": "VARCHAR",
-        "scope": "local",
-        "default_value": ""
-    },
-    {
-        "name": "resultdb_cardinality_file",
-        "description": "Immutable injected ResultDB cardinalities, loaded at SET time",
-        "type": "VARCHAR",
-        "scope": "local",
-        "custom_implementation": true
-    },
-    {
         "name": "resultdb_cost_build",
         "description": "Paper ResultDB build cost weight",
         "type": "DOUBLE",

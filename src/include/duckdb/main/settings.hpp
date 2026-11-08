@@ -1610,26 +1610,6 @@ struct OptimizerStatisticsFileSetting {
  static Value GetSetting(const ClientContext &context);
 };
 
-struct ResultdbCardinalityDatasetSetting {
-	using RETURN_TYPE = string;
-	static constexpr const char *Name = "resultdb_cardinality_dataset";
-	static constexpr const char *Description = "Dataset key in the ResultDB cardinality JSON file";
-	static constexpr const char *InputType = "VARCHAR";
-	static constexpr const char *DefaultValue = "";
-	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
-	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
-};
-
-struct ResultdbCardinalityFileSetting {
-	using RETURN_TYPE = string;
-	static constexpr const char *Name = "resultdb_cardinality_file";
-	static constexpr const char *Description = "Immutable injected ResultDB cardinalities, loaded at SET time";
-	static constexpr const char *InputType = "VARCHAR";
-	static void SetLocal(ClientContext &context, const Value &parameter);
-	static void ResetLocal(ClientContext &context);
-	static Value GetSetting(const ClientContext &context);
-};
-
 struct ResultdbCostBuildSetting {
 	using RETURN_TYPE = double;
 	static constexpr const char *Name = "resultdb_cost_build";

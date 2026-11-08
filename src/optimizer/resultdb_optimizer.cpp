@@ -8,7 +8,6 @@
 
 #include "duckdb/optimizer/resultdb_optimizer.hpp"
 #include "duckdb/optimizer/resultdb_plan_enumerator.hpp"
-#include "duckdb/optimizer/resultdb_cardinalities.hpp"
 #include "duckdb/optimizer/native_row_oracle.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/settings.hpp"
@@ -1295,24 +1294,15 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::PlanEnumerated(
 		}
 		aliases.push_back(entry->second);
 	}
-	properties.cardinality_snapshot = ClientConfig::GetConfig(context).resultdb_cardinalities;
-	properties.cardinality_load_ms = ClientConfig::GetConfig(context).resultdb_cardinality_load_ms;
-	properties.cardinality_dataset = Settings::Get<ResultdbCardinalityDatasetSetting>(context);
 	auto oracle = ClientConfig::GetConfig(context).native_oracle_active;
-	unique_ptr<ResultDBInjectedCardinalities> injected;
-	unique_ptr<ResultDBOptimizedCardinalities> optimized;
-	if (oracle) {
-		optimized = make_uniq<ResultDBOptimizedCardinalities>(*oracle, analysis);
-		properties.cardinality_snapshot.reset();
-		properties.cardinality_sha256 = oracle->file ? oracle->file->sha256 : "discovery";
-		properties.cardinality_dataset = "optimized-inputs";
-		properties.cardinality_load_ms = ClientConfig::GetConfig(context).native_oracle_load_ms;
-	} else {
-		injected = make_uniq<ResultDBInjectedCardinalities>(properties.cardinality_snapshot, properties.cardinality_dataset, aliases);
-		properties.cardinality_sha256 = properties.cardinality_snapshot->sha256;
+	if (!oracle) {
+		throw InvalidInputException("Paper ResultDB requires the native row oracle; "
+		                            "discover and count optimized-input requests offline first");
 	}
-	ResultDBEnumerationCostProvider &cards = optimized ? static_cast<ResultDBEnumerationCostProvider &>(*optimized)
-	                                                : static_cast<ResultDBEnumerationCostProvider &>(*injected);
+	ResultDBOptimizedCardinalities cards(*oracle, analysis);
+	properties.cardinality_sha256 = oracle->file ? oracle->file->sha256 : "discovery";
+	properties.cardinality_dataset = "optimized-inputs";
+	properties.cardinality_load_ms = ClientConfig::GetConfig(context).native_oracle_load_ms;
 	properties.optimizer_mode = "paper";
 	ResultDBCostWeights weights;
 	weights.join = Settings::Get<ResultdbCostJoinSetting>(context);
@@ -1397,7 +1387,7 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::PlanEnumerated(
 	properties.execution_strategy = ResultDBExecutionStrategy::SEMIJOIN;
 	properties.planning_reason = "paper " + ResultDBStrategyToString(strategy) + " with injected cardinalities";
 	plan = make_uniq_base<LogicalOperator, LogicalDummyScan>(binder.GenerateTableIndex());
-	properties.cardinality_lookups = optimized ? optimized->lookups : injected->lookups;
+	properties.cardinality_lookups = cards.lookups;
 	properties.enumeration_time_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 	return plan;
 }
@@ -1541,6 +1531,10 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::Optimize(unique_ptr<LogicalOperat
 			throw BinderException("ResultDB tdroot requires an acyclic connected original query graph");
 		}
 	}
+	if (enumerated && !ClientConfig::GetConfig(context).native_oracle_active) {
+		throw InvalidInputException("Paper ResultDB requires the native row oracle; "
+		                            "discover and count optimized-input requests offline first");
+	}
 	// Only an actual logical proof of emptiness can take this shortcut. Injected
 	// row estimates are not consulted here and never become such a proof.
 	if (ResultDBHasEmptyInput(*plan)) {
@@ -1556,17 +1550,9 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::Optimize(unique_ptr<LogicalOperat
 		if (enumerated) {
 			properties.paper_planned = true;
 			properties.optimizer_mode = "paper";
-			properties.cardinality_snapshot = ClientConfig::GetConfig(context).resultdb_cardinalities;
-			properties.cardinality_load_ms = ClientConfig::GetConfig(context).resultdb_cardinality_load_ms;
-			properties.cardinality_dataset = Settings::Get<ResultdbCardinalityDatasetSetting>(context);
-			if (properties.cardinality_snapshot) {
-				properties.cardinality_sha256 = properties.cardinality_snapshot->sha256;
-			}
-			if (oracle) {
-				properties.cardinality_snapshot.reset();
-				properties.cardinality_dataset = "optimized-inputs";
-				properties.cardinality_sha256 = oracle->file ? oracle->file->sha256 : "discovery";
-			}
+			properties.cardinality_dataset = "optimized-inputs";
+			properties.cardinality_sha256 = oracle->file ? oracle->file->sha256 : "discovery";
+			properties.cardinality_load_ms = ClientConfig::GetConfig(context).native_oracle_load_ms;
 		}
 		program = BuildResultDBEmptyYannakakisProgram(binder);
 		properties.execution_strategy = ResultDBExecutionStrategy::SEMIJOIN;
@@ -1575,10 +1561,6 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::Optimize(unique_ptr<LogicalOperat
 	}
 	AttachResultDBOptimizedInputs(*captured, *plan, context);
 	if (enumerated && strategy == ResultDBStrategy::AUTO) {
-		if (!ClientConfig::GetConfig(context).native_oracle_active) {
-			throw InvalidInputException("Paper AUTO requires the native row oracle; "
-			                            "discover and count optimized-input requests offline first");
-		}
 		// Construct the direct candidate on copied inputs. Leave the main query
 		// intact so native join ordering can produce the competing decompose plan.
 		PlanEnumerated(plan->Copy(context), auto_program);
