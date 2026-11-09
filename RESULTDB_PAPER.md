@@ -104,8 +104,8 @@ vertices and original occurrence identities. Algorithm 3 is a local fold
 selection heuristic, including its top-down term. The final direct score uses
 the selected folds' join/decomposition costs plus TDRoot, not that heuristic.
 
-Native oracle mode also supplies counts during internal relation/fold optimization,
-including projected working-tuple DISTINCT outputs. Scoped adapters resolve new
+Native oracle mode also supplies bag counts during internal relation/fold optimization.
+Scoped adapters resolve new
 projection bindings back to original occurrences. Paper-selected fold join trees
 remain fixed; heuristic folds retain native join reordering. Degree/index heuristic
 root and fold decisions remain independent of estimates. Historical campaigns
@@ -172,11 +172,10 @@ optimal TVC routine discussed in the paper. Work is explicitly bounded by
 occurrences and 20 occurrences per enumerated join. Exceeding limits fails strict
 planning, including `auto`, rather than silently selecting another optimizer.
 
-Native folded working relations retain their existing early DISTINCT; final
-public outputs retain independent duplicate elimination and `QueryResult::next`.
-Injected join-bag cardinalities therefore need not equal physical working-row
-counts after that DISTINCT. This is an execution/cost-model difference to measure,
-not a reason to change ResultDB semantics or the baseline.
+Native folded working relations preserve join-bag multiplicities through the
+semijoin reductions. Final public outputs retain independent duplicate elimination
+and `QueryResult::next`. The former early fold DISTINCT is no longer inserted;
+historical campaigns that used it remain measurements of their frozen builds.
 
 ## Validation and experiments
 

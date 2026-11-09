@@ -686,17 +686,6 @@ static bool ChooseResultDBRootRelation(ResultDBSemijoinGraph &graph, const Resul
 	return BuildResultDBJoinTree(graph, best_root, tree_adjacency, best_parent, best_parent_edge, best_order);
 }
 
-static vector<unique_ptr<Expression>> BuildResultDBDistinctTargets(const vector<string> &names,
-                                                                   const vector<LogicalType> &types,
-                                                                   TableIndex projection_index) {
-	vector<unique_ptr<Expression>> distinct_targets;
-	for (idx_t column_idx = 0; column_idx < types.size(); column_idx++) {
-		distinct_targets.push_back(make_uniq<BoundColumnRefExpression>(
-		    names[column_idx], types[column_idx], ColumnBinding(projection_index, ProjectionIndex(column_idx))));
-	}
-	return distinct_targets;
-}
-
 static bool SameResultDBSourceColumn(const ResultDBYannakakisSourceColumn &left,
                                      const ResultDBYannakakisSourceColumn &right) {
 	return left.table_index == right.table_index && left.source_column_index == right.source_column_index &&
@@ -978,14 +967,8 @@ static unique_ptr<LogicalOperator> BuildResultDBNodeMaterializationPlan(Binder &
 	auto projection_index = binder.GenerateTableIndex();
 	auto projection = make_uniq<LogicalProjection>(projection_index, std::move(projection_expressions));
 	projection->AddChild(std::move(base_plan));
-	if (!node.folded && node.tables.size() == 1) {
-		return std::move(projection);
-	}
-
-	auto distinct = make_uniq<LogicalDistinct>(
-	    BuildResultDBDistinctTargets(relation.names, relation.types, projection_index), DistinctType::DISTINCT);
-	distinct->AddChild(std::move(projection));
-	return std::move(distinct);
+	// Preserve the join bag through reductions; public outputs are deduplicated by the collector.
+	return std::move(projection);
 }
 
 static unique_ptr<ResultDBYannakakisProgram>

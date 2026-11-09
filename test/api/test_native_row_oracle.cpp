@@ -53,7 +53,20 @@ TEST_CASE("Native row oracle validates immutable profile fingerprints and values
 	REQUIRE_THROWS(NativeRowOracleFile::Parse(prefix + entry + "]}", "fixture"));
 }
 
-TEST_CASE("Internal ResultDB plans consume exact rows including working DISTINCT", "[native_row_oracle][internal_oracle]") {
+static bool HasWorkingAggregation(PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::HASH_GROUP_BY || op.type == PhysicalOperatorType::PERFECT_HASH_GROUP_BY ||
+	    op.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (HasWorkingAggregation(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "[native_row_oracle][internal_oracle]") {
 	auto database = TestCreatePath("internal_resultdb_oracle.duckdb");
 	auto profile = TestCreatePath("internal_resultdb_oracle.json");
 	DeleteDatabase(database);
@@ -113,6 +126,7 @@ TEST_CASE("Internal ResultDB plans consume exact rows including working DISTINCT
 	REQUIRE(converged);
 	REQUIRE_NO_FAIL(con.Query("SET optimizer_statistics_discovery=false; SET optimizer_statistics_mode='oracle'"));
 	idx_t working_distinct = 0, build_probe = 0, final_physical = 0;
+	string required_fold_bag_key;
 	for (auto &strategy : strategies) {
 		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='" + strategy + "'"));
 		for (idx_t q = 0; q < queries.size(); q++) {
@@ -123,6 +137,11 @@ TEST_CASE("Internal ResultDB plans consume exact rows including working DISTINCT
 			auto audit = prepared->data->properties.native_row_oracle;
 			REQUIRE(audit->missing == 0);
 			REQUIRE(!ClientConfig::GetConfig(*con.context).native_oracle_active);
+			if (q == 0 && prepared->data->resultdb_yannakakis_program) {
+				for (auto &base : prepared->data->resultdb_yannakakis_program->base_plans) {
+					REQUIRE(!HasWorkingAggregation(base->Root()));
+				}
+			}
 			if (q == 0 && strategy == "semijoin") {
 				auto &program = *prepared->data->resultdb_yannakakis_program;
 				bool checked_fold = false;
@@ -133,9 +152,17 @@ TEST_CASE("Internal ResultDB plans consume exact rows including working DISTINCT
 						names.insert(prepared->data->properties.resultdb.occurrence_aliases.at(table));
 					}
 					REQUIRE(names == std::set<string> {"x", "y"});
-					// Independently: the A/B join has 2*2+1=5 rows, but only
-					// (1,1,'x',1,1) and (2,1,'y',2,1) are distinct working tuples.
-					REQUIRE(program.base_plans[i]->Root().estimated_cardinality == 2);
+					// Independently: the A/B join retains 2*2+1=5 bag rows,
+					// even though its working projection has only two distinct tuples.
+					REQUIRE(program.base_plans[i]->Root().estimated_cardinality == 5);
+					auto phase = "internal[" + std::to_string(i) + "]";
+					for (auto &item : audit->requests) {
+						auto &request = item.second;
+						if (request.stage.find(phase) != string::npos &&
+						    request.stage.find("physical_input") != string::npos && request.cardinality == 5) {
+							required_fold_bag_key = item.first;
+						}
+					}
 					checked_fold = true;
 				}
 				REQUIRE(checked_fold);
@@ -159,7 +186,8 @@ TEST_CASE("Internal ResultDB plans consume exact rows including working DISTINCT
 			NativeCompare(*actual, *expected);
 		}
 	}
-	REQUIRE(working_distinct > 0);
+	REQUIRE(working_distinct == 0);
+	REQUIRE(!required_fold_bag_key.empty());
 	REQUIRE(build_probe > 0);
 	REQUIRE(final_physical > 0);
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='semijoin'"));
@@ -186,18 +214,13 @@ TEST_CASE("Internal ResultDB plans consume exact rows including working DISTINCT
 	REQUIRE(saved->data->properties.native_row_oracle->file == old_file);
 	REQUIRE(Settings::Get<OptimizerStatisticsModeSetting>(*con.context) == "estimated");
 	// A missing internal count must fail strictly and must not leak its adapter.
-	string excluded;
-	for (auto &audit : audits) {
-		for (auto &item : audit->requests) {
-			if (item.second.sql.find("SELECT DISTINCT") != string::npos) { excluded = item.first; break; }
-		}
-		if (!excluded.empty()) { break; }
-	}
-	NativeWrite(profile, NativeProfile(database, audits, counter, false, excluded));
+	NativeWrite(profile, NativeProfile(database, audits, counter, false, required_fold_bag_key));
 	REQUIRE_NO_FAIL(con.Query("SET optimizer_statistics_file='" + profile + "'; SET optimizer_statistics_mode='oracle'; SET resultdb_strategy='semijoin'"));
 	auto missing = con.Prepare(queries[0]);
 	REQUIRE(missing->HasError());
 	REQUIRE(missing->GetError().find("Missing native row cardinality") != string::npos);
+	REQUIRE(missing->GetError().find(required_fold_bag_key) != string::npos);
+	REQUIRE(missing->GetError().find("internal[") != string::npos);
 	REQUIRE(!ClientConfig::GetConfig(*con.context).native_oracle_active);
 }
 

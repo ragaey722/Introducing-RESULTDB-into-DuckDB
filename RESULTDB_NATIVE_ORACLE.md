@@ -41,8 +41,10 @@ and strict coverage rules apply. Existing four-baseline profiles are preserved;
 new reduction counts belong in fresh artifacts. Each internal working plan has a
 scoped binding adapter, sharing the immutable profile and preparation audit while
 keeping its own operator pins. Projection/cast lineage resolves to original
-occurrences. Folded DISTINCT requests count the complete working tuple, including
-boundary keys, separately from its input join bag. Generated projection IDs are
+occurrences. Fold inputs preserve join-bag multiplicities; duplicate elimination
+occurs at the public outputs. Existing DISTINCT-description support and historical
+profile entries are retained, but fold construction no longer requests an early
+working-tuple DISTINCT. Generated projection IDs are
 not request identities. Paper fold join trees remain fixed; oracle rows reach
 later native optimization even when join ordering is skipped. Counts are refreshed
 before build/probe decisions and physical planning and retained through statistics

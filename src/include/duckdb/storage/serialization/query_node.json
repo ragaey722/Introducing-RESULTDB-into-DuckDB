@@ -79,6 +79,12 @@
         "id": 208,
         "name": "qualify",
         "type": "ParsedExpression*"
+      },
+      {
+        "id": 209,
+        "name": "resultdb",
+        "type": "bool",
+        "default": "false"
       }
     ]
   },

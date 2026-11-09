@@ -10,6 +10,9 @@
 #include "duckdb/main/client_config.hpp"
 #include "native_row_oracle_test_helpers.hpp"
 #include "duckdb/common/types/hash.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/binary_deserializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -325,6 +328,25 @@ TEST_CASE("Test multiple result sets", "[api]") {
 	result = std::move(result->next);
 	REQUIRE(CHECK_COLUMN(result, 0, {84}));
 	REQUIRE(!result->next);
+}
+
+TEST_CASE("Test ResultDB parser flag survives binary serialization", "[api][resultdb][serialization]") {
+	for (bool resultdb : {false, true}) {
+		Parser parser;
+		parser.ParseQuery(string("SELECT ") + (resultdb ? "RESULTDB " : "") +
+		                  "a.id, b.value FROM a JOIN b ON a.id=b.id WHERE a.id>1");
+		auto &original = *parser.statements[0]->Cast<SelectStatement>().node;
+		REQUIRE(original.Cast<SelectNode>().resultdb == resultdb);
+		Allocator allocator;
+		MemoryStream stream(allocator);
+		SerializationOptions options;
+		options.serialize_default_values = false;
+		BinarySerializer::Serialize(original, stream, options);
+		stream.Rewind();
+		auto restored = BinaryDeserializer::Deserialize<QueryNode>(stream);
+		REQUIRE(restored->Cast<SelectNode>().resultdb == resultdb);
+		REQUIRE(restored->Equals(&original));
+	}
 }
 
 TEST_CASE("Test ResultDB query returns source relations", "[api]") {
