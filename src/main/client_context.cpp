@@ -855,11 +855,7 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	if (statement_type == StatementType::SELECT_STATEMENT &&
 	    (result->properties.native_statistics_mode == "oracle" || discovery)) {
 		auto &resultdb = result->properties.resultdb;
-		bool paper_direct = resultdb.enabled && Settings::Get<ResultdbOptimizerSetting>(*this) == "paper" &&
-		                    (resultdb.requested_strategy == ResultDBStrategy::AUTO ||
-		                     resultdb.requested_strategy == ResultDBStrategy::TDROOT ||
-		                     resultdb.requested_strategy == ResultDBStrategy::TDFOLD ||
-		                     resultdb.requested_strategy == ResultDBStrategy::TDFOLD_NO_TVC);
+		bool paper_direct = resultdb.enabled && ResultDBStrategyIsEnumerated(resultdb.requested_strategy);
 		if (!logical_plan || result->properties.parameter_count || !config.enable_optimizer ||
 		    (resultdb.enabled && resultdb.requested_strategy != ResultDBStrategy::DECOMPOSE &&
 		     resultdb.requested_strategy != ResultDBStrategy::SEMIJOIN && !paper_direct)) {
@@ -896,6 +892,11 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 		if (logical_plan->type != LogicalOperatorType::LOGICAL_EXPLAIN) {
 			optimize = false;
 		}
+	}
+	auto &resultdb = result->properties.resultdb;
+	if (resultdb.enabled && !resultdb.planning_phase && resultdb.requested_strategy != ResultDBStrategy::DECOMPOSE &&
+	    !optimize) {
+		throw InvalidInputException("Direct ResultDB strategies require enabled optimization");
 	}
 	unique_ptr<ResultDBYannakakisProgram> resultdb_yannakakis_program;
 	if (optimize && logical_plan->RequireOptimizer()) {

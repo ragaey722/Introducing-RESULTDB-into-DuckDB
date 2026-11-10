@@ -34,8 +34,7 @@ public:
 	                                        unique_ptr<ResultDBYannakakisProgram> &program);
 
 private:
-	unique_ptr<LogicalOperator> PlanEnumerated(unique_ptr<LogicalOperator> plan,
-	                                           unique_ptr<ResultDBYannakakisProgram> &program);
+	void PlanEnumerated(unique_ptr<ResultDBYannakakisProgram> &program);
 	Binder &binder;
 	ClientContext &context;
 	unique_ptr<ResultDBSemijoinAnalysis> captured;

@@ -1387,6 +1387,37 @@ struct OperatorMemoryLimitSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct OptimizerStatisticsDiscoverySetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "optimizer_statistics_discovery";
+	static constexpr const char *Description = "Offline request discovery; prepared SELECT statements cannot execute";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "false";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct OptimizerStatisticsFileSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "optimizer_statistics_file";
+	static constexpr const char *Description = "Immutable native row oracle profile, loaded at SET time";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct OptimizerStatisticsModeSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "optimizer_statistics_mode";
+	static constexpr const char *Description = "Experimental native row statistics: estimated or oracle";
+	static constexpr const char *InputType = "VARCHAR";
+	static constexpr const char *DefaultValue = "estimated";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
 struct OrderByNonIntegerLiteralSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "order_by_non_integer_literal";
@@ -1581,35 +1612,6 @@ struct ProgressBarTimeSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
-struct OptimizerStatisticsModeSetting {
- using RETURN_TYPE = string;
- static constexpr const char *Name = "optimizer_statistics_mode";
- static constexpr const char *Description = "Experimental native row statistics: estimated or oracle";
- static constexpr const char *InputType = "VARCHAR";
- static constexpr const char *DefaultValue = "estimated";
- static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
- static void OnSet(SettingCallbackInfo &info, Value &input);
- static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
-};
-struct OptimizerStatisticsDiscoverySetting {
- using RETURN_TYPE = bool;
- static constexpr const char *Name = "optimizer_statistics_discovery";
- static constexpr const char *Description = "Offline request discovery; prepared SELECT statements cannot execute";
- static constexpr const char *InputType = "BOOLEAN";
- static constexpr const char *DefaultValue = "false";
- static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
- static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
-};
-struct OptimizerStatisticsFileSetting {
- using RETURN_TYPE = string;
- static constexpr const char *Name = "optimizer_statistics_file";
- static constexpr const char *Description = "Immutable native row oracle profile, loaded at SET time";
- static constexpr const char *InputType = "VARCHAR";
- static void SetLocal(ClientContext &context, const Value &parameter);
- static void ResetLocal(ClientContext &context);
- static Value GetSetting(const ClientContext &context);
-};
-
 struct ResultdbCostBuildSetting {
 	using RETURN_TYPE = double;
 	static constexpr const char *Name = "resultdb_cost_build";
@@ -1659,28 +1661,18 @@ struct ResultdbEnumerationLimitSetting {
 	static constexpr const char *Name = "resultdb_enumeration_limit";
 	static constexpr const char *Description = "Maximum paper ResultDB enumeration work units";
 	static constexpr const char *InputType = "UBIGINT";
-	static constexpr const char *DefaultValue = "200000";
+	static constexpr const char *DefaultValue = "3000000";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
-};
-
-struct ResultdbOptimizerSetting {
-	using RETURN_TYPE = string;
-	static constexpr const char *Name = "resultdb_optimizer";
-	static constexpr const char *Description = "ResultDB optimizer implementation (legacy or paper)";
-	static constexpr const char *InputType = "VARCHAR";
-	static constexpr const char *DefaultValue = "legacy";
-	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
-	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
-	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
 struct ResultdbStrategySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "resultdb_strategy";
-	static constexpr const char *Description = "Execution strategy used for SELECT RESULTDB queries (decompose, semijoin, tdroot, tdfold_no_tvc, tdfold, auto)";
+	static constexpr const char *Description = "ResultDB strategy (Plain, Decompose, TD_heuristic, TD_root, TD_fold, "
+	                                           "TD_fold_no_tvc, Auto); Plain uses ordinary SELECT";
 	static constexpr const char *InputType = "VARCHAR";
-	static constexpr const char *DefaultValue = "decompose";
+	static constexpr const char *DefaultValue = "Decompose";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 	static void OnSet(SettingCallbackInfo &info, Value &input);
@@ -1897,7 +1889,6 @@ struct ZstdMinStringLengthSetting {
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
-
 
 struct GeneratedSettingInfo {
 	static constexpr idx_t MaxSettingIndex = NEXT_SETTING_INDEX();

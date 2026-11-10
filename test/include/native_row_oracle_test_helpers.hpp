@@ -83,11 +83,10 @@ inline void NativeWrite(const string &path, const string &text) {
 }
 
 inline void SealResultDBOracle(Connection &con, Connection &counter, const string &database, const string &profile,
-                       const vector<string> &queries, bool zeros = false,
-                       const vector<string> &strategies = {"auto", "tdfold", "tdfold_no_tvc", "decompose"}) {
+                               const vector<string> &queries, bool zeros = false,
+                               const vector<string> &strategies = {"Auto", "TD_fold", "TD_fold_no_tvc", "Decompose"}) {
 	vector<shared_ptr<NativeRowOracle>> audits;
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_optimizer='paper'; "
-	                          "SET resultdb_enumeration_limit=3000000; SET optimizer_statistics_discovery=true"));
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_enumeration_limit=3000000; SET optimizer_statistics_discovery=true"));
 	bool complete = false;
 	for (idx_t round = 0; round < 12; round++) {
 		idx_t missing = 0;

@@ -55,7 +55,6 @@ struct ResultDBSemijoinAnalysis {
 
 struct ResultDBSemijoinGraphNode {
 	vector<TableIndex> tables;
-	idx_t estimated_cardinality = 0;
 	bool folded = false;
 	bool enumerated_fold = false;
 	idx_t stable_id = DConstants::INVALID_INDEX;
@@ -796,7 +795,6 @@ static ResultDBEnumerationInput BuildResultDBEnumerationInput(const ResultDBSemi
 	for (auto &graph_node : graph.nodes) {
 		ResultDBEnumerationNode node;
 		node.stable_id = graph_node.stable_id;
-		node.cardinality = static_cast<double>(graph_node.estimated_cardinality);
 		node.requested = ResultDBNodeContainsOutputTable(graph_node, properties);
 		result.nodes.push_back(node);
 	}
@@ -807,8 +805,7 @@ static ResultDBEnumerationInput BuildResultDBEnumerationInput(const ResultDBSemi
 }
 
 static bool ApplyResultDBFoldPartition(const ResultDBSemijoinAnalysis &analysis, ResultDBSemijoinGraph &graph,
-	                                   const vector<vector<idx_t>> &folds,
-	                                   ResultDBEnumerationCostProvider &costs) {
+                                       const vector<vector<idx_t>> &folds) {
 	vector<uint8_t> assigned(graph.nodes.size(), 0);
 	vector<vector<idx_t>> partition;
 	for (auto fold : folds) {
@@ -848,7 +845,6 @@ static bool ApplyResultDBFoldPartition(const ResultDBSemijoinAnalysis &analysis,
 		node.folded = node.tables.size() > 1;
 		node.enumerated_fold = node.folded;
 		node.stable_id = ResultDBNodeStableId(node);
-		node.estimated_cardinality = static_cast<idx_t>(std::ceil(costs.Cardinality(group)));
 		contracted_nodes.push_back(std::move(node));
 	}
 	graph.nodes = std::move(contracted_nodes);
@@ -1032,11 +1028,6 @@ BuildResultDBYannakakisProgram(Binder &binder, ResultDBSemijoinAnalysis &analysi
 		auto &source_column_indices = needed_columns[relation_pos];
 		SortResultDBSourceColumns(source_column_indices);
 		relation.source_columns = std::move(source_column_indices);
-		if (relation.table_index != DConstants::INVALID_INDEX) {
-			for (auto &source_column : relation.source_columns) {
-				relation.source_column_indices.push_back(source_column.source_column_index);
-			}
-		}
 
 		relation.base_plan = BuildResultDBNodeMaterializationPlan(binder, analysis, node, relation);
 	}
@@ -1141,7 +1132,6 @@ static unique_ptr<ResultDBYannakakisProgram> BuildResultDBEmptyYannakakisProgram
 		SortResultDBSourceColumns(needed_columns[table_metadata_idx]);
 		relation.source_columns = std::move(needed_columns[table_metadata_idx]);
 		for (auto &source_column : relation.source_columns) {
-			relation.source_column_indices.push_back(source_column.source_column_index);
 			relation.names.push_back(StringUtil::Format("resultdb_empty_%llu_%llu", source_column.table_index,
 			                                            source_column.source_column_index));
 			relation.types.push_back(GetResultDBEmptySourceColumnType(table, source_column.source_column_index));
@@ -1203,19 +1193,6 @@ public:
 			}
 		}
 	}
-	double Cardinality(const vector<idx_t> &nodes) override {
-		uint64_t mask = 0;
-		for (auto node : nodes) {
-			if (node >= inputs.size()) {
-				throw InternalException("Invalid optimized ResultDB occurrence");
-			}
-			mask |= uint64_t(1) << node;
-		}
-		return ReducedCardinality(mask, 0);
-	}
-	double PayloadWidth(const vector<idx_t> &) override {
-		throw InternalException("Paper ResultDB costs count output occurrences, not bytes");
-	}
 	double ReducedCardinality(uint64_t left, uint64_t right) override {
 		if (!left || ((left | right) >> inputs.size()) || (left & right)) {
 			throw InternalException("Invalid optimized ResultDB reduction masks");
@@ -1259,8 +1236,7 @@ private:
 	unordered_map<uint64_t, unordered_map<uint64_t, double>> values;
 };
 
-unique_ptr<LogicalOperator> ResultDBOptimizer::PlanEnumerated(
-    unique_ptr<LogicalOperator> plan, unique_ptr<ResultDBYannakakisProgram> &program) {
+void ResultDBOptimizer::PlanEnumerated(unique_ptr<ResultDBYannakakisProgram> &program) {
 	auto &properties = binder.GetStatementProperties().resultdb;
 	auto strategy = properties.requested_strategy;
 	auto start = std::chrono::steady_clock::now();
@@ -1296,7 +1272,6 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::PlanEnumerated(
 	auto input = BuildResultDBEnumerationInput(graph, properties);
 	for (idx_t i = 0; i < input.nodes.size(); i++) {
 		input.nodes[i].relations = uint64_t(1) << i;
-		input.nodes[i].cardinality = cards.ReducedCardinality(input.nodes[i].relations, 0);
 	}
 	ResultDBRootEnumerationResult root;
 	ResultDBPaperPlan chosen;
@@ -1316,8 +1291,9 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::PlanEnumerated(
 		properties.fold_candidate_count = chosen.candidate_count;
 		properties.block_sizes = chosen.block_sizes;
 		properties.tvc_enabled = strategy != ResultDBStrategy::TDFOLD_NO_TVC;
+		properties.tvc_used = chosen.used_tvc;
 		analysis.paper_join_splits = std::move(chosen.join_splits);
-		if (!ApplyResultDBFoldPartition(analysis, graph, chosen.folds, cards)) {
+		if (!ApplyResultDBFoldPartition(analysis, graph, chosen.folds)) {
 			throw InternalException("Invalid paper ResultDB fold partition: %s", graph.unsupported_reason);
 		}
 		auto contracted = BuildResultDBEnumerationInput(graph, properties);
@@ -1369,10 +1345,8 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::PlanEnumerated(
 	}
 	properties.execution_strategy = ResultDBExecutionStrategy::SEMIJOIN;
 	properties.planning_reason = "paper " + ResultDBStrategyToString(strategy) + " with injected cardinalities";
-	plan = make_uniq_base<LogicalOperator, LogicalDummyScan>(binder.GenerateTableIndex());
 	properties.cardinality_lookups = cards.lookups;
 	properties.enumeration_time_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-	return plan;
 }
 
 ResultDBOptimizer::ResultDBOptimizer(Binder &binder, ClientContext &context)
@@ -1390,6 +1364,7 @@ static void ResetResultDBPlanningDiagnostics(ResultDBProperties &properties) {
 	properties.fold_candidate_count = 0;
 	properties.block_sizes.clear();
 	properties.tvc_enabled = false;
+	properties.tvc_used = false;
 	properties.planning_reason.clear();
 }
 
@@ -1417,8 +1392,7 @@ void ResultDBOptimizer::CaptureGraph(LogicalOperator &plan) {
 		return;
 	}
 	auto strategy = properties.requested_strategy;
-	enumerated = properties.enabled && strategy != ResultDBStrategy::DECOMPOSE &&
-	             strategy != ResultDBStrategy::SEMIJOIN && Settings::Get<ResultdbOptimizerSetting>(context) == "paper";
+	enumerated = properties.enabled && ResultDBStrategyIsEnumerated(strategy);
 	bool heuristic = properties.enabled && strategy == ResultDBStrategy::SEMIJOIN;
 	if (!enumerated && !heuristic) {
 		return;
@@ -1500,12 +1474,7 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::Optimize(unique_ptr<LogicalOperat
 			properties.planning_reason = "explicit decompose strategy";
 			return plan;
 		}
-		if (strategy == ResultDBStrategy::AUTO) {
-			properties.planning_reason = "paper optimizer disabled; selected decompose";
-			return plan;
-		}
-		throw BinderException("ResultDB root/fold enumeration requires resultdb_optimizer='paper' and injected "
-		                      "cardinalities; the legacy enumerator has been removed");
+		throw InternalException("ResultDB direct strategy has no captured query graph");
 	}
 	StoreResultDBJoinMetadata(properties, *captured);
 	if (enumerated && strategy == ResultDBStrategy::TDROOT) {
@@ -1546,11 +1515,12 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::Optimize(unique_ptr<LogicalOperat
 	if (enumerated && strategy == ResultDBStrategy::AUTO) {
 		// Construct the direct candidate on copied inputs. Leave the main query
 		// intact so native join ordering can produce the competing decompose plan.
-		PlanEnumerated(plan->Copy(context), auto_program);
+		PlanEnumerated(auto_program);
 		return plan;
 	}
 	if (enumerated) {
-		return PlanEnumerated(std::move(plan), program);
+		PlanEnumerated(program);
+		return make_uniq_base<LogicalOperator, LogicalDummyScan>(binder.GenerateTableIndex());
 	}
 	auto &analysis = *captured;
 	vector<idx_t> parent;
@@ -1624,6 +1594,7 @@ unique_ptr<LogicalOperator> ResultDBOptimizer::FinalizeAuto(
 		properties.execution_strategy = ResultDBExecutionStrategy::DECOMPOSE;
 		properties.selected_join_tree = std::move(native_tree);
 		properties.selected_folds.clear();
+		properties.tvc_used = false;
 		properties.selected_root_table_index = DConstants::INVALID_INDEX;
 		properties.reduction_schedule.clear();
 		properties.estimated_join_cost = join_cost;

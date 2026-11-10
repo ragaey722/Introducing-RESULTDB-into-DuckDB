@@ -1,27 +1,38 @@
 # Experimental paper ResultDB optimizer
 
-`resultdb_optimizer='legacy'` remains the default. Ordinary `decompose`, ordinary
-SQL join planning retain their existing behavior. All direct strategies now share
-one `ResultDBOptimizer` with graph-capture and execution-planning phases.
-The previous simplified root/fold enumerator has been removed. TDRoot, TDFold-NoTVC,
-TDFold and AUTO enumeration require paper mode and a native row-oracle profile.
-Outside paper mode, `auto` selects ordinary decompose without enumeration; explicit
-root/fold strategies report a configuration error. The `legacy` setting remains
-for compatibility and the baseline paths; it no longer selects an old enumerator.
+One `ResultDBOptimizer` captures the original graph, attaches optimized local
+inputs after filter propagation, and dispatches strategy selection. Use the
+single `resultdb_strategy` selector below; the old `resultdb_optimizer` gate has
+been removed. Its former AUTO-to-decompose fallback is no longer available.
+
+| Strategy | SQL | Statistics |
+|---|---|---|
+| `Plain` | ordinary `SELECT` | estimated or oracle |
+| `Decompose` (default) | `SELECT RESULTDB` | estimated or oracle |
+| `TD_heuristic` | `SELECT RESULTDB` | estimated or oracle for internal native plans |
+| `TD_root` | `SELECT RESULTDB` over an acyclic original graph | oracle |
+| `TD_fold_no_tvc` | `SELECT RESULTDB` | oracle |
+| `TD_fold` | `SELECT RESULTDB` | oracle |
+| `Auto` | `SELECT RESULTDB` | oracle |
+
+Ordinary SELECT always retains its flat output, regardless of the selector.
+`Plain` with `SELECT RESULTDB` is rejected. The heuristic retains degree/index
+root and fold decisions in both statistics modes. Discovery may use estimates
+only to collect offline requests; discovery plans cannot execute.
 
 ## Configuration
 
 ```sql
 SET optimizer_statistics_file = '/absolute/path/native_oracle.json';
 SET optimizer_statistics_mode = 'oracle';
-SET resultdb_optimizer = 'paper';
-SET resultdb_strategy = 'tdfold';
+SET resultdb_strategy = 'TD_fold';
 SELECT RESULTDB a.id, b.id FROM a, b WHERE a.id = b.id;
 ```
 
-Paper strategies are `tdroot` (acyclic input), `tdfold_no_tvc`, `tdfold`, and `auto`
-(a DuckDB adaptation of TDResultDB, described below). Explicit `semijoin` remains the legacy heuristic. Explicit
-`decompose` uses DuckDB's native join planner, as does ordinary plain SQL.
+Canonical strategy names are case-insensitive. Historical input spellings
+`semijoin`, `tdroot`, `tdfold`, `tdfold_no_tvc`, `tdfold-no-tvc`, and `tdresultdb`
+remain aliases. Settings and new diagnostics emit the canonical names.
+`Decompose` and ordinary SQL use DuckDB's native join planner.
 The former `resultdb_join_planner='cout'` option has been removed. The paper
 enumerator still uses C_out to choose joins inside direct ResultDB folds.
 
@@ -37,11 +48,10 @@ AUTO now compares TDFold against **native-oracle decompose**. It no longer
 compares against the historical injected-C_out decompose candidate. Configure:
 
 ```sql
-SET resultdb_optimizer='paper';
 SET resultdb_enumeration_limit=3000000;
 SET optimizer_statistics_file='/absolute/path/optimized_input_oracle.json';
 SET optimizer_statistics_mode='oracle';
-SET resultdb_strategy='auto';
+SET resultdb_strategy='Auto';
 ```
 
 The single ResultDB optimizer captures the original graph, attaches the inputs
@@ -124,8 +134,8 @@ The heuristic strategy also uses this captured graph. Its fold and root choices 
 canonicalization has been removed: an original triangle remains a triangle and
 may require a heuristic fold. Existing historical heuristic measurements describe
 the previous implementation and must not be relabeled as results for this one.
-The `legacy`/`paper` setting remains a compatibility/configuration gate for
-enumerated strategies; it no longer denotes a separate optimizer object or phase.
+All strategies share these phases; only root, fold and reduction-schedule
+selection differs. AUTO additionally compares against the native decompose tree.
 
 The native oracle supplies counts for the actual optimized inputs, including
 propagated filters. Historical Mutable-format counts have a different scope and
@@ -135,7 +145,7 @@ Subplan optimization may simplify expressions and choose physical operators;
 join re-enumeration is disabled for selected folded join trees. Build/probe
 orientation is still DuckDB's physical choice; C_out is symmetric in that choice.
 
-Default coefficients are:
+Optional advanced cost settings retain these fixed default coefficients:
 
 | Setting | Default | Term |
 |---|---:|---|
@@ -168,7 +178,7 @@ Connected TVC pairs match the reference implementation's candidate restriction;
 nonadjacent Cartesian-product folds are not enumerated. The implementation uses
 simple graph searches for TVCs and connected complements, not the asymptotically
 optimal TVC routine discussed in the paper. Work is explicitly bounded by
-`resultdb_enumeration_limit` (default 200000); there are at most 62 original
+`resultdb_enumeration_limit` (default 3000000); there are at most 62 original
 occurrences and 20 occurrences per enumerated join. Exceeding limits fails strict
 planning, including `auto`, rather than silently selecting another optimizer.
 
@@ -202,3 +212,7 @@ join `{0.5,1,2}`, build `{1,2,3,4}`, and decomposition `{0.5,1,2}`. Deduplicate
 identical selected plans, validate before timing, and group related JOB templates
 within deterministic five-fold validation. Report held-out measurements separately
 from the untuned profile. Existing T1/T6 artifacts do not validate this implementation.
+
+New diagnostics distinguish `tvc_enabled` (search allowed) from `tvc_used`
+(the selected direct plan actually uses a TVC). AUTO selecting Decompose reports
+`tvc_used=false`. Historical enabled-only artifacts cannot establish actual usage.

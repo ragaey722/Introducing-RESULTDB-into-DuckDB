@@ -23,15 +23,7 @@ class PaperTestCardinalities : public ResultDBEnumerationCostProvider {
 public:
 	explicit PaperTestCardinalities(CardFunction card_p) : card(std::move(card_p)) {
 	}
-	double Cardinality(const vector<idx_t> &nodes) override {
-		Mask mask = 0;
-		for (auto node : nodes) { mask |= Mask(1) << node; }
-		return card(mask, 0);
-	}
 	double ReducedCardinality(Mask left, Mask right) override { return card(left, right); }
-	double PayloadWidth(const vector<idx_t> &) override {
-		throw InternalException("Paper fixture costs do not use payload width");
-	}
 private:
 	CardFunction card;
 };
@@ -39,7 +31,7 @@ private:
 static ResultDBEnumerationInput PaperGraph(idx_t n, const vector<ResultDBEnumerationEdge> &edges, Mask requested) {
 	ResultDBEnumerationInput graph;
 	for (idx_t i = 0; i < n; i++) {
-		graph.nodes.push_back({i, 0, (requested & (Mask(1) << i)) != 0, Mask(1) << i});
+		graph.nodes.push_back({i, (requested & (Mask(1) << i)) != 0, Mask(1) << i});
 	}
 	graph.edges = edges;
 	return graph;
@@ -559,7 +551,6 @@ TEST_CASE("Paper strategies require a native row oracle",
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE narrow_a(k BOOLEAN); CREATE TABLE narrow_b(k BOOLEAN)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO narrow_a VALUES (TRUE), (FALSE); "
 	                          "INSERT INTO narrow_b VALUES (TRUE), (FALSE)"));
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_optimizer='paper'"));
 	for (auto strategy : {"tdroot", "tdfold_no_tvc", "tdfold", "auto"}) {
 		REQUIRE_NO_FAIL(con.Query(string("SET resultdb_strategy='") + strategy + "'"));
 		auto result = con.Query("SELECT RESULTDB * FROM narrow_a a JOIN narrow_b b ON a.k=b.k");

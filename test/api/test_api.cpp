@@ -477,8 +477,13 @@ TEST_CASE("Test ResultDB strategy setting", "[api]") {
 
 	auto setting_result = con.Query("SELECT current_setting('resultdb_strategy')");
 	REQUIRE(!setting_result->HasError());
-	REQUIRE(CHECK_COLUMN(setting_result, 0, {"decompose"}));
+	REQUIRE(CHECK_COLUMN(setting_result, 0, {"Decompose"}));
 
+	REQUIRE(CHECK_COLUMN(*con.Query("SELECT current_setting('resultdb_enumeration_limit')"), 0, {3000000}));
+	REQUIRE(con.Query("SET resultdb_optimizer='paper'")->HasError());
+	REQUIRE_NO_FAIL(con.Query("SET worker_threads=1; SET user='selector-test'"));
+	REQUIRE(CHECK_COLUMN(*con.Query("SELECT current_setting('threads')"), 0, {1}));
+	REQUIRE(CHECK_COLUMN(*con.Query("SELECT current_setting('username')"), 0, {"selector-test"}));
 	auto invalid_strategy = con.Query("SET resultdb_strategy = 'invalid'");
 	REQUIRE(invalid_strategy->HasError());
 
@@ -489,28 +494,49 @@ TEST_CASE("Test ResultDB strategy setting", "[api]") {
 		ResultDBStrategy execution_strategy;
 	};
 	vector<StrategyCase> strategy_cases = {
-	    {"decompose", "decompose", ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE},
-	    {"SEMIJOIN", "semijoin", ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN},
-	    {"tdroot", "tdroot", ResultDBStrategy::TDROOT, ResultDBStrategy::SEMIJOIN},
-	    {"tdfold-no-tvc", "tdfold_no_tvc", ResultDBStrategy::TDFOLD_NO_TVC, ResultDBStrategy::SEMIJOIN},
-	    {"tdfold", "tdfold", ResultDBStrategy::TDFOLD, ResultDBStrategy::SEMIJOIN},
-	    {"auto", "auto", ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE},
-	    {"tdresultdb", "auto", ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE},
+	    {"Plain", "Plain", ResultDBStrategy::PLAIN, ResultDBStrategy::PLAIN},
+	    {"Decompose", "Decompose", ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE},
+	    {"TD_heuristic", "TD_heuristic", ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN},
+	    {"SEMIJOIN", "TD_heuristic", ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN},
+	    {"TD_root", "TD_root", ResultDBStrategy::TDROOT, ResultDBStrategy::SEMIJOIN},
+	    {"tdroot", "TD_root", ResultDBStrategy::TDROOT, ResultDBStrategy::SEMIJOIN},
+	    {"TD_fold_no_tvc", "TD_fold_no_tvc", ResultDBStrategy::TDFOLD_NO_TVC, ResultDBStrategy::SEMIJOIN},
+	    {"tdfold-no-tvc", "TD_fold_no_tvc", ResultDBStrategy::TDFOLD_NO_TVC, ResultDBStrategy::SEMIJOIN},
+	    {"TD_fold", "TD_fold", ResultDBStrategy::TDFOLD, ResultDBStrategy::SEMIJOIN},
+	    {"tdfold", "TD_fold", ResultDBStrategy::TDFOLD, ResultDBStrategy::SEMIJOIN},
+	    {"auto", "Auto", ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE},
+	    {"tdresultdb", "Auto", ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE},
 	};
 
 	const string from_clause = " FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount >= 100";
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='TD_heuristic'; SET debug_disable_optimizer=true"));
+	auto disabled = con.Query("SELECT RESULTDB *" + from_clause);
+	REQUIRE(disabled->HasError());
+	REQUIRE(disabled->GetError().find("require enabled optimization") != string::npos);
+	REQUIRE_NO_FAIL(con.Query("RESET debug_disable_optimizer"));
 	for (auto &strategy_case : strategy_cases) {
 		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy_case.input + "'"));
 		setting_result = con.Query("SELECT current_setting('resultdb_strategy')");
 		REQUIRE(!setting_result->HasError());
 		REQUIRE(CHECK_COLUMN(setting_result, 0, {strategy_case.stored_value}));
 
+		// The selector never changes ordinary SELECT's representation.
+		auto plain = con.Query("SELECT *" + from_clause);
+		REQUIRE(!plain->HasError());
+		REQUIRE(!plain->properties.resultdb.enabled);
+		REQUIRE(ResultDBSelectedStrategy(plain->properties.resultdb) == ResultDBStrategy::PLAIN);
 		duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + from_clause);
+		if (strategy_case.requested_strategy == ResultDBStrategy::PLAIN) {
+			REQUIRE(result->HasError());
+			REQUIRE(result->GetError().find("requires ordinary SELECT") != string::npos);
+			continue;
+		}
 		if (strategy_case.requested_strategy == ResultDBStrategy::TDROOT ||
 		    strategy_case.requested_strategy == ResultDBStrategy::TDFOLD_NO_TVC ||
-		    strategy_case.requested_strategy == ResultDBStrategy::TDFOLD) {
+		    strategy_case.requested_strategy == ResultDBStrategy::TDFOLD ||
+		    strategy_case.requested_strategy == ResultDBStrategy::AUTO) {
 			REQUIRE(result->HasError());
-			REQUIRE(result->GetError().find("requires resultdb_optimizer='paper'") != string::npos);
+			REQUIRE(result->GetError().find("requires the native row oracle") != string::npos);
 			continue;
 		}
 		INFO(result->GetError());
@@ -573,7 +599,17 @@ TEST_CASE("Test ResultDB semijoin deduplicates duplicate source rows", "[api]") 
 
 	for (auto &strategy_case : strategy_cases) {
 		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy_case.setting + "'"));
+		// The selector never changes ordinary SELECT's representation.
+		auto plain = con.Query("SELECT *" + from_clause);
+		REQUIRE(!plain->HasError());
+		REQUIRE(!plain->properties.resultdb.enabled);
+		REQUIRE(ResultDBSelectedStrategy(plain->properties.resultdb) == ResultDBStrategy::PLAIN);
 		duckdb::unique_ptr<QueryResult> result = con.Query("SELECT RESULTDB *" + from_clause);
+		if (strategy_case.requested_strategy == ResultDBStrategy::PLAIN) {
+			REQUIRE(result->HasError());
+			REQUIRE(result->GetError().find("requires ordinary SELECT") != string::npos);
+			continue;
+		}
 		REQUIRE(!result->HasError());
 		RequireResultDBStrategy(*result, strategy_case.requested_strategy, strategy_case.execution_strategy);
 
@@ -856,13 +892,18 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = '" + strategy + "'"));
 		result = con.Query("SELECT RESULTDB *" + cyclic_from);
 		REQUIRE(result->HasError());
-		REQUIRE(result->GetError().find("requires resultdb_optimizer='paper'") != string::npos);
+		REQUIRE(result->GetError().find(strategy == "tdroot" ? "requires an acyclic"
+		                                                     : "requires the native row oracle") != string::npos);
 	}
 
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'Auto'"));
+	result = con.Query("SELECT RESULTDB *" + cyclic_from);
+	REQUIRE(result->HasError());
+	REQUIRE(result->GetError().find("requires the native row oracle") != string::npos);
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'Decompose'"));
 	result = con.Query("SELECT RESULTDB *" + cyclic_from);
 	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
+	RequireResultDBStrategy(*result, ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE);
 	REQUIRE(result->properties.resultdb.join_edges.empty());
 	RequireResultDBTable(*result, "a", *expected_cyclic_a);
 	result = std::move(result->next);
@@ -883,10 +924,13 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 		REQUIRE(result->HasError());
 	}
 
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'Auto'"));
+	result = con.Query("SELECT RESULTDB *" + non_equality_from);
+	REQUIRE(result->HasError());
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'Decompose'"));
 	result = con.Query("SELECT RESULTDB *" + non_equality_from);
 	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
+	RequireResultDBStrategy(*result, ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE);
 
 	const string cross_table_where_from = " FROM a JOIN b ON a.id = b.a_id WHERE a.id = b.a_id";
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
@@ -894,10 +938,13 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 	REQUIRE(!result->HasError());
 	RequireResultDBStrategy(*result, ResultDBStrategy::SEMIJOIN, ResultDBStrategy::SEMIJOIN);
 
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'Auto'"));
+	result = con.Query("SELECT RESULTDB *" + cross_table_where_from);
+	REQUIRE(result->HasError());
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'Decompose'"));
 	result = con.Query("SELECT RESULTDB *" + cross_table_where_from);
 	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
+	RequireResultDBStrategy(*result, ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE);
 
 	const string cross_product_where_from = " FROM a, b WHERE a.id = b.a_id";
 	auto expected_cross_product_a = con.Query("SELECT DISTINCT a.id" + cross_product_where_from);
@@ -979,8 +1026,11 @@ TEST_CASE("Test ResultDB semijoin strategy support", "[api]") {
 
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'auto'"));
 	result = con.Query("SELECT RESULTDB *" + cross_table_non_equality_where_from);
+	REQUIRE(result->HasError());
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'Decompose'"));
+	result = con.Query("SELECT RESULTDB *" + cross_table_non_equality_where_from);
 	REQUIRE(!result->HasError());
-	RequireResultDBStrategy(*result, ResultDBStrategy::AUTO, ResultDBStrategy::DECOMPOSE);
+	RequireResultDBStrategy(*result, ResultDBStrategy::DECOMPOSE, ResultDBStrategy::DECOMPOSE);
 
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy = 'semijoin'"));
 	result = con.Query("SELECT RESULTDB * FROM a JOIN b ON a.id = b.a_id WHERE 1 = 0");

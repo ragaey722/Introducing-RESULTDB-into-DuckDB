@@ -70,13 +70,17 @@ class ClientContext;
 
 //! User-visible ResultDB planning variants. AUTO is the paper's TDResultDB
 //! comparison between an optimized semijoin plan and decompose.
-enum class ResultDBStrategy : uint8_t { DECOMPOSE, SEMIJOIN, TDROOT, TDFOLD_NO_TVC, TDFOLD, AUTO };
+enum class ResultDBStrategy : uint8_t { DECOMPOSE, SEMIJOIN, TDROOT, TDFOLD_NO_TVC, TDFOLD, AUTO, PLAIN };
 
 //! Physical ResultDB representation selected by planning.
 enum class ResultDBExecutionStrategy : uint8_t { DECOMPOSE, SEMIJOIN };
 
 DUCKDB_API ResultDBStrategy ResultDBStrategyFromString(const string &strategy);
 DUCKDB_API string ResultDBStrategyToString(ResultDBStrategy strategy);
+
+struct ResultDBProperties;
+DUCKDB_API bool ResultDBStrategyIsEnumerated(ResultDBStrategy strategy);
+DUCKDB_API ResultDBStrategy ResultDBSelectedStrategy(const ResultDBProperties &properties);
 
 //! Metadata that lets the result collector split a flat SELECT RESULTDB result
 //! back into separate per-table results.
@@ -140,6 +144,7 @@ struct ResultDBProperties {
 	idx_t fold_candidate_count = 0;
 	vector<idx_t> block_sizes;
 	bool tvc_enabled = false;
+	bool tvc_used = false;
 	string planning_reason;
 	//! Tables to return after decomposing the flat SELECT result, in output order.
 	vector<ResultDBTableMetadata> tables;

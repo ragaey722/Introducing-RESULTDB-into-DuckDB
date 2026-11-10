@@ -955,6 +955,30 @@
         "custom_implementation": true
     },
     {
+        "name": "optimizer_statistics_discovery",
+        "description": "Offline request discovery; prepared SELECT statements cannot execute",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "default_value": "false"
+    },
+    {
+        "name": "optimizer_statistics_file",
+        "description": "Immutable native row oracle profile, loaded at SET time",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "optimizer_statistics_mode",
+        "description": "Experimental native row statistics: estimated or oracle",
+        "type": "VARCHAR",
+        "scope": "local",
+        "default_value": "estimated",
+        "on_callbacks": [
+            "set"
+        ]
+    },
+    {
         "name": "order_by_non_integer_literal",
         "description": "Allow ordering by non-integer literals - ordering by such literals has no effect.",
         "type": "BOOLEAN",
@@ -1134,24 +1158,14 @@
         "description": "Maximum paper ResultDB enumeration work units",
         "type": "UBIGINT",
         "scope": "local",
-        "default_value": "200000"
-    },
-    {
-        "name": "resultdb_optimizer",
-        "description": "ResultDB optimizer implementation (legacy or paper)",
-        "type": "VARCHAR",
-        "scope": "local",
-        "default_value": "legacy",
-        "on_callbacks": [
-            "set"
-        ]
+        "default_value": "3000000"
     },
     {
         "name": "resultdb_strategy",
-        "description": "Execution strategy used for SELECT RESULTDB queries (decompose, semijoin, tdroot, tdfold_no_tvc, tdfold, auto)",
+        "description": "ResultDB strategy (Plain, Decompose, TD_heuristic, TD_root, TD_fold, TD_fold_no_tvc, Auto); Plain uses ordinary SELECT",
         "type": "VARCHAR",
         "default_scope": "local",
-        "default_value": "decompose",
+        "default_value": "Decompose",
         "on_callbacks": [
             "set"
         ]
@@ -1306,29 +1320,5 @@
         "type": "UBIGINT",
         "scope": "global",
         "default_value": "4096"
-    },
-    {
-        "name": "optimizer_statistics_mode",
-        "description": "Experimental native row statistics: estimated or oracle",
-        "type": "VARCHAR",
-        "scope": "local",
-        "default_value": "estimated",
-        "on_callbacks": [
-            "set"
-        ]
-    },
-    {
-        "name": "optimizer_statistics_file",
-        "description": "Immutable native row oracle profile, loaded at SET time",
-        "type": "VARCHAR",
-        "scope": "local",
-        "custom_implementation": true
-    },
-    {
-        "name": "optimizer_statistics_discovery",
-        "description": "Offline request discovery; prepared SELECT statements cannot execute",
-        "type": "BOOLEAN",
-        "scope": "local",
-        "default_value": "false"
     }
 ]

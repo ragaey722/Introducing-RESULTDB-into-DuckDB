@@ -30,12 +30,10 @@ struct ResultDBYannakakisRelation {
 	vector<idx_t> table_indices;
 	//! Source columns stored in this working relation, in working-column order.
 	vector<ResultDBYannakakisSourceColumn> source_columns;
-	//! Source column indexes for single-table working relations.
-	vector<idx_t> source_column_indices;
 	//! Working relation output names/types.
 	vector<string> names;
 	vector<LogicalType> types;
-	//! Logical plan that produces the filtered/projected working relation. Folded plans retain DISTINCT.
+	//! Logical plan that produces the filtered/projected working bag, including native joins inside folds.
 	unique_ptr<LogicalOperator> base_plan;
 	//! Keep an exact TDFold join tree from being re-enumerated by the per-phase optimizer.
 	bool preserve_join_order = false;

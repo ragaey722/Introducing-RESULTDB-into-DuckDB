@@ -8,44 +8,66 @@ namespace duckdb {
 
 ResultDBStrategy ResultDBStrategyFromString(const string &strategy) {
 	auto normalized = StringUtil::Lower(strategy);
+	if (normalized == "plain") {
+		return ResultDBStrategy::PLAIN;
+	}
 	if (normalized == "decompose") {
 		return ResultDBStrategy::DECOMPOSE;
 	}
-	if (normalized == "semijoin") {
+	if (normalized == "semijoin" || normalized == "td_heuristic") {
 		return ResultDBStrategy::SEMIJOIN;
 	}
-	if (normalized == "tdroot") {
+	if (normalized == "tdroot" || normalized == "td_root") {
 		return ResultDBStrategy::TDROOT;
 	}
-	if (normalized == "tdfold_no_tvc" || normalized == "tdfold-no-tvc") {
+	if (normalized == "tdfold_no_tvc" || normalized == "td_fold_no_tvc" || normalized == "tdfold-no-tvc") {
 		return ResultDBStrategy::TDFOLD_NO_TVC;
 	}
-	if (normalized == "tdfold") {
+	if (normalized == "tdfold" || normalized == "td_fold") {
 		return ResultDBStrategy::TDFOLD;
 	}
 	if (normalized == "auto" || normalized == "tdresultdb") {
 		return ResultDBStrategy::AUTO;
 	}
-	throw InvalidInputException("Unrecognized resultdb_strategy \"%s\". Expected decompose, semijoin, tdroot, "
-	                            "tdfold_no_tvc, tdfold, auto, or tdresultdb", strategy);
+	throw InvalidInputException("Unrecognized resultdb_strategy \"%s\". Expected Plain, Decompose, TD_heuristic, "
+	                            "TD_root, TD_fold, TD_fold_no_tvc, or Auto",
+	                            strategy);
 }
 
 string ResultDBStrategyToString(ResultDBStrategy strategy) {
 	switch (strategy) {
+	case ResultDBStrategy::PLAIN:
+		return "Plain";
 	case ResultDBStrategy::DECOMPOSE:
-		return "decompose";
+		return "Decompose";
 	case ResultDBStrategy::SEMIJOIN:
-		return "semijoin";
+		return "TD_heuristic";
 	case ResultDBStrategy::TDROOT:
-		return "tdroot";
+		return "TD_root";
 	case ResultDBStrategy::TDFOLD_NO_TVC:
-		return "tdfold_no_tvc";
+		return "TD_fold_no_tvc";
 	case ResultDBStrategy::TDFOLD:
-		return "tdfold";
+		return "TD_fold";
 	case ResultDBStrategy::AUTO:
-		return "auto";
+		return "Auto";
 	}
 	throw InternalException("Unknown ResultDB strategy");
+}
+
+bool ResultDBStrategyIsEnumerated(ResultDBStrategy strategy) {
+	return strategy == ResultDBStrategy::TDROOT || strategy == ResultDBStrategy::TDFOLD_NO_TVC ||
+	       strategy == ResultDBStrategy::TDFOLD || strategy == ResultDBStrategy::AUTO;
+}
+
+ResultDBStrategy ResultDBSelectedStrategy(const ResultDBProperties &properties) {
+	if (!properties.enabled) {
+		return ResultDBStrategy::PLAIN;
+	}
+	if (properties.execution_strategy == ResultDBExecutionStrategy::DECOMPOSE) {
+		return ResultDBStrategy::DECOMPOSE;
+	}
+	return properties.requested_strategy == ResultDBStrategy::AUTO ? ResultDBStrategy::TDFOLD
+	                                                               : properties.requested_strategy;
 }
 
 // LCOV_EXCL_START

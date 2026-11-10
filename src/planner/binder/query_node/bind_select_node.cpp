@@ -771,7 +771,7 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 	result.column_count = new_names.size();
 	result.names = std::move(new_names);
 	result.need_prune = result.select_list.size() > result.column_count;
-	if (Settings::Get<ResultdbOptimizerSetting>(context) == "paper") {
+	if (statement.resultdb) {
 		for (auto &binding : bind_context.GetBindingsList()) {
 			GetStatementProperties().resultdb.occurrence_aliases[binding->GetIndex().index] = binding->GetAlias();
 		}
@@ -783,6 +783,9 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 		properties.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
 		properties.resultdb.enabled = true;
 		properties.resultdb.requested_strategy = ResultDBStrategyFromString(Settings::Get<ResultdbStrategySetting>(context));
+		if (properties.resultdb.requested_strategy == ResultDBStrategy::PLAIN) {
+			throw BinderException("resultdb_strategy='Plain' requires ordinary SELECT, not SELECT RESULTDB");
+		}
 		properties.resultdb.execution_strategy = ResultDBExecutionStrategy::DECOMPOSE;
 		properties.resultdb.join_edges.clear();
 		properties.resultdb.tables = BuildResultDBTables(resultdb_columns, result.names, result.types);

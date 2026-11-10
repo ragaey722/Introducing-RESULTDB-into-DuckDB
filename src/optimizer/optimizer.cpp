@@ -322,6 +322,21 @@ void Optimizer::RunBuiltInOptimizers() {
 		RunOptimizer(OptimizerType::COMMON_SUBPLAN, [&]() {
 			CommonSubplanOptimizer common_subplan_optimizer(*this);
 			plan = common_subplan_optimizer.Optimize(std::move(plan));
+			if (internal_oracle) {
+				// The oracle identifies original scan occurrences. Shared CTE refs
+				// introduced here have no mapping, including in the main query.
+				std::function<void(LogicalOperator &)> check = [&](LogicalOperator &op) {
+					if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+					    op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+						throw InvalidInputException(
+						    "Native row oracle: unsupported shared CTE mapping after common_subplan");
+					}
+					for (auto &child : op.children) {
+						check(*child);
+					}
+				};
+				check(*plan);
+			}
 		});
 	}
 

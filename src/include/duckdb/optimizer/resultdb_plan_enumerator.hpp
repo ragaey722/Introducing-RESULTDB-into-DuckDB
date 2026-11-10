@@ -17,15 +17,12 @@ class ResultDBEnumerationCostProvider {
 public:
 	virtual ~ResultDBEnumerationCostProvider() = default;
 
-	virtual double Cardinality(const vector<idx_t> &nodes) = 0;
-	virtual double PayloadWidth(const vector<idx_t> &nodes) = 0;
 	//! Paper mode: original occurrence masks, never contracted node indexes.
 	virtual double ReducedCardinality(uint64_t relations, uint64_t reduced_by) = 0;
 };
 
 struct ResultDBEnumerationNode {
 	idx_t stable_id = DConstants::INVALID_INDEX;
-	double cardinality = 0;
 	bool requested = false;
 	uint64_t relations = 0;
 };
@@ -88,7 +85,7 @@ public:
 	                                                        const ResultDBCostWeights &weights);
 	static ResultDBPaperPlan EnumeratePaper(const ResultDBEnumerationInput &input,
 	                                        ResultDBEnumerationCostProvider &costs, const ResultDBCostWeights &weights,
-	                                        bool use_tvc, idx_t work_limit = 200000);
+	                                        bool use_tvc, idx_t work_limit = 3000000);
 };
 
 } // namespace duckdb

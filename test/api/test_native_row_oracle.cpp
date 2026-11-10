@@ -7,6 +7,10 @@
 #include "duckdb/planner/resultdb_reduced_plan.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/main/profiling_node.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include <set>
 
@@ -15,7 +19,8 @@ using namespace duckdb;
 TEST_CASE("Native oracle settings preserve existing configuration aliases", "[native_row_oracle]") {
 	REQUIRE(!DBConfig::GetOptionByName("resultdb_cardinality_file"));
 	REQUIRE(!DBConfig::GetOptionByName("resultdb_cardinality_dataset"));
-	for (auto &names : vector<std::pair<string, string>> {{"worker_threads", "threads"}, {"user", "username"}}) {
+	for (auto &names : vector<std::pair<string, string>> {
+	         {"worker_threads", "threads"}, {"user", "username"}, {"profiling_output", "profile_output"}}) {
 		auto alias = DBConfig::GetOptionByName(names.first);
 		auto canonical = DBConfig::GetOptionByName(names.second);
 		REQUIRE(alias);
@@ -66,6 +71,89 @@ static bool HasWorkingAggregation(PhysicalOperator &op) {
 	return false;
 }
 
+// Ignore unary working projections and build/probe swaps, but preserve every
+// binary join split. Unique base names in this fixture identify occurrences.
+static string WorkingJoinTree(PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+		auto &scan = op.Cast<PhysicalTableScan>();
+		auto name = scan.bind_data->Cast<TableScanBindData>().table.name;
+		return name == "a" ? "x" : name == "b" ? "y" : name == "c" ? "z" : "w";
+	}
+	if (op.children.size() == 1) {
+		return WorkingJoinTree(op.children[0]);
+	}
+	REQUIRE((op.type == PhysicalOperatorType::HASH_JOIN || op.type == PhysicalOperatorType::CROSS_PRODUCT));
+	REQUIRE(op.children.size() == 2);
+	auto left = WorkingJoinTree(op.children[0]);
+	auto right = WorkingJoinTree(op.children[1]);
+	return "(" + MinValue(left, right) + "," + MaxValue(left, right) + ")";
+}
+
+static string UnorientedJoinTree(const string &tree, idx_t &pos) {
+	if (tree[pos] != '(') {
+		return string(1, tree[pos++]);
+	}
+	pos++;
+	auto left = UnorientedJoinTree(tree, pos);
+	REQUIRE(tree[pos++] == ',');
+	auto right = UnorientedJoinTree(tree, pos);
+	REQUIRE(tree[pos++] == ')');
+	return "(" + MinValue(left, right) + "," + MaxValue(left, right) + ")";
+}
+
+static void CheckPreparedSchedule(const PreparedResultDBYannakakisProgram &program) {
+	std::set<idx_t> completed;
+	vector<idx_t> bu_position(program.relations.size(), DConstants::INVALID_INDEX);
+	for (idx_t i = 0; i < program.bottom_up_steps.size(); i++) {
+		auto &step = program.bottom_up_steps[i];
+		REQUIRE(program.parent[step.source_relation] == step.target_relation);
+		for (idx_t child = 0; child < program.relations.size(); child++) {
+			if (program.parent[child] == step.source_relation) {
+				REQUIRE(completed.count(child) == 1);
+			}
+		}
+		REQUIRE(completed.insert(step.source_relation).second);
+		bu_position[step.source_relation] = i;
+	}
+	REQUIRE(completed.size() + 1 == program.relations.size());
+	if (!program.bottom_up_children.empty()) {
+		for (auto &siblings : program.bottom_up_children) {
+			for (idx_t i = 1; i < siblings.size(); i++) {
+				REQUIRE(bu_position[siblings[i - 1]] < bu_position[siblings[i]]);
+			}
+		}
+	}
+	std::set<idx_t> required, reduced {program.root_relation};
+	for (auto &output : program.outputs) {
+		for (auto node = output.relation; node != program.root_relation; node = program.parent[node]) {
+			required.insert(node);
+		}
+	}
+	for (auto &step : program.top_down_steps) {
+		REQUIRE(reduced.count(step.source_relation) == 1);
+		REQUIRE(required.erase(step.target_relation) == 1);
+		REQUIRE(program.parent[step.target_relation] == step.source_relation);
+		REQUIRE(reduced.insert(step.target_relation).second);
+	}
+	REQUIRE(required.empty());
+}
+
+static idx_t ProfiledFiveRowFold(ProfilingNode &node) {
+	auto &info = node.GetProfilingInfo();
+	idx_t found = 0;
+	if (info.metrics.count(MetricType::OPERATOR_NAME) &&
+	    info.GetMetricValue<string>(MetricType::OPERATOR_NAME) == "HASH_JOIN") {
+		// With runtime join filters disabled, this is the native A/B working
+		// bag: two duplicate A rows times two B rows, plus the key-2 pair.
+		REQUIRE(info.GetMetricValue<idx_t>(MetricType::OPERATOR_CARDINALITY) == 5);
+		found++;
+	}
+	for (auto &child : node.children) {
+		found += ProfiledFiveRowFold(*child);
+	}
+	return found;
+}
+
 TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "[native_row_oracle][internal_oracle]") {
 	auto database = TestCreatePath("internal_resultdb_oracle.duckdb");
 	auto profile = TestCreatePath("internal_resultdb_oracle.json");
@@ -85,14 +173,16 @@ TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "
 	config.options.access_mode = AccessMode::READ_ONLY;
 	DuckDB db(database, &config);
 	Connection con(db), counter(db);
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='join_filter_pushdown'"));
 	vector<string> queries {
 	    "SELECT RESULTDB x.s,x.p,y.s,z.s FROM a x,b y,c z WHERE CAST(x.s AS BIGINT)=y.s AND x.d=z.s AND y.d=z.d",
 	    "SELECT RESULTDB x.s,y.s FROM a x,b y WHERE CAST(x.s AS BIGINT)=y.s AND x.s=1",
 	    "SELECT RESULTDB x.s,y.s FROM a x,a y WHERE x.s=y.s AND x.s=99",
 	    "SELECT RESULTDB x.s FROM a x WHERE x.s IS NULL",
-	    "SELECT RESULTDB x.s,y.s,z.s FROM a x,b_empty y,c z WHERE CAST(x.s AS BIGINT)=y.s AND x.d=z.s AND y.d=z.d"};
+	    "SELECT RESULTDB x.s,y.s,z.s FROM a x,b_empty y,c z WHERE CAST(x.s AS BIGINT)=y.s AND x.d=z.s AND y.d=z.d",
+	    "SELECT RESULTDB x.s FROM a x,b y,c z WHERE CAST(x.s AS BIGINT)=y.s AND y.s=z.s"};
 	vector<string> strategies {"semijoin", "tdfold", "tdfold_no_tvc", "auto", "decompose"};
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_optimizer='paper'; SET resultdb_enumeration_limit=3000000; "
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_enumeration_limit=3000000; "
 	                          "SET optimizer_statistics_discovery=true"));
 	vector<shared_ptr<NativeRowOracle>> audits;
 	bool converged = false;
@@ -114,11 +204,13 @@ TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "
 			}
 		}
 		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='tdroot'"));
-		auto tree = con.Prepare(queries[1]);
-		INFO((tree->HasError() ? tree->GetError() : "tdroot"));
-		REQUIRE(!tree->HasError());
-		audits.push_back(tree->data->properties.native_row_oracle);
-		missing += audits.back()->missing;
+		for (auto q : {idx_t(1), idx_t(5)}) {
+			auto tree = con.Prepare(queries[q]);
+			INFO((tree->HasError() ? tree->GetError() : "tdroot"));
+			REQUIRE(!tree->HasError());
+			audits.push_back(tree->data->properties.native_row_oracle);
+			missing += audits.back()->missing;
+		}
 		NativeWrite(profile, NativeProfile(database, audits, counter));
 		REQUIRE_NO_FAIL(con.Query("SET optimizer_statistics_file='" + profile + "'"));
 		if (!missing) { converged = true; break; }
@@ -131,15 +223,36 @@ TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "
 		REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='" + strategy + "'"));
 		for (idx_t q = 0; q < queries.size(); q++) {
 			if (q == 3 && strategy != "decompose") { continue; }
+			if (q == 0 && strategy == "semijoin") {
+				con.EnableProfiling();
+				con.context->config.emit_profiler_output = false;
+			}
 			auto prepared = con.Prepare(queries[q]);
 			INFO(strategy + ": " + (prepared->HasError() ? prepared->GetError() : queries[q]));
 			REQUIRE(!prepared->HasError());
 			auto audit = prepared->data->properties.native_row_oracle;
 			REQUIRE(audit->missing == 0);
+			auto &chosen = prepared->data->properties.resultdb;
+			REQUIRE((!chosen.tvc_used || chosen.tvc_enabled));
+			if (chosen.execution_strategy == ResultDBExecutionStrategy::DECOMPOSE || strategy == "tdfold_no_tvc") {
+				REQUIRE(!chosen.tvc_used);
+			}
 			REQUIRE(!ClientConfig::GetConfig(*con.context).native_oracle_active);
-			if (q == 0 && prepared->data->resultdb_yannakakis_program) {
+			if ((q == 0 || q == 5) && prepared->data->resultdb_yannakakis_program) {
+				auto &program = *prepared->data->resultdb_yannakakis_program;
+				CheckPreparedSchedule(program);
 				for (auto &base : prepared->data->resultdb_yannakakis_program->base_plans) {
 					REQUIRE(!HasWorkingAggregation(base->Root()));
+				}
+				if (strategy == "tdfold" || strategy == "tdfold_no_tvc") {
+					auto descriptions = StringUtil::Split(prepared->data->properties.resultdb.selected_join_tree, ';');
+					REQUIRE(descriptions.size() == program.base_plans.size());
+					for (idx_t i = 0; i < descriptions.size(); i++) {
+						idx_t position = 0;
+						REQUIRE(WorkingJoinTree(program.base_plans[i]->Root()) ==
+						        UnorientedJoinTree(descriptions[i], position));
+						REQUIRE(position == descriptions[i].size());
+					}
 				}
 			}
 			if (q == 0 && strategy == "semijoin") {
@@ -184,8 +297,22 @@ TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "
 			auto actual = prepared->Execute();
 			REQUIRE_NO_FAIL(*actual); REQUIRE_NO_FAIL(*expected);
 			NativeCompare(*actual, *expected);
+			if (q == 0 && strategy == "semijoin") {
+				REQUIRE(con.GetProfilingTree());
+				REQUIRE(ProfiledFiveRowFold(*con.GetProfilingTree()) == 1);
+				con.DisableProfiling();
+			}
 		}
 	}
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='TD_root'"));
+	auto tree = con.Prepare(queries[5]);
+	REQUIRE(!tree->HasError());
+	CheckPreparedSchedule(*tree->data->resultdb_yannakakis_program);
+	auto tree_result = tree->Execute();
+	auto tree_expected = counter.Query(queries[5]);
+	REQUIRE_NO_FAIL(*tree_result);
+	REQUIRE_NO_FAIL(*tree_expected);
+	NativeCompare(*tree_result, *tree_expected);
 	REQUIRE(working_distinct == 0);
 	REQUIRE(!required_fold_bag_key.empty());
 	REQUIRE(build_probe > 0);
@@ -224,13 +351,106 @@ TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "
 	REQUIRE(!ClientConfig::GetConfig(*con.context).native_oracle_active);
 }
 
+TEST_CASE("Paper four-relation folds execute the costed join splits", "[native_row_oracle][internal_oracle]") {
+	auto database = TestCreatePath("native_four_relation_fold.duckdb");
+	auto profile = TestCreatePath("native_four_relation_fold.json");
+	DeleteDatabase(database);
+	{
+		DuckDB writable(database);
+		Connection create(writable);
+		REQUIRE_NO_FAIL(create.Query("CREATE TABLE a(k INTEGER); CREATE TABLE b(k INTEGER); "
+		                             "CREATE TABLE c(k INTEGER); CREATE TABLE d(k INTEGER); "
+		                             "INSERT INTO a VALUES (1); INSERT INTO b VALUES (1); "
+		                             "INSERT INTO c VALUES (1); INSERT INTO d VALUES (1); CHECKPOINT"));
+	}
+	DBConfig config;
+	config.options.access_mode = AccessMode::READ_ONLY;
+	DuckDB db(database, &config);
+	Connection con(db), counter(db);
+	string query = "SELECT RESULTDB x.k,y.k,z.k FROM a x,b y,c z,d w "
+	               "WHERE x.k=y.k AND x.k=z.k AND x.k=w.k AND y.k=z.k AND y.k=w.k AND z.k=w.k";
+	SealResultDBOracle(con, counter, database, profile, {query}, false, {"TD_fold", "TD_fold_no_tvc"});
+	for (auto strategy : {"TD_fold", "TD_fold_no_tvc"}) {
+		REQUIRE_NO_FAIL(con.Query(string("SET resultdb_strategy='") + strategy + "'"));
+		auto prepared = con.Prepare(query);
+		INFO((prepared->HasError() ? prepared->GetError() : query));
+		REQUIRE(!prepared->HasError());
+		auto &properties = prepared->data->properties.resultdb;
+		// Independently: full folding costs 3 join rows + 3 output occurrences.
+		// Every split adds Algorithm 3 neighbor work, so full folding wins.
+		REQUIRE(properties.selected_folds.size() == 1);
+		REQUIRE(properties.selected_folds[0].size() == 4);
+		REQUIRE(properties.estimated_semijoin_cost == 6);
+		auto &program = *prepared->data->resultdb_yannakakis_program;
+		REQUIRE(program.base_plans.size() == 1);
+		idx_t position = 0;
+		REQUIRE(WorkingJoinTree(program.base_plans[0]->Root()) ==
+		        UnorientedJoinTree(properties.selected_join_tree, position));
+		REQUIRE(position == properties.selected_join_tree.size());
+		auto actual = prepared->Execute();
+		auto expected = counter.Query(query);
+		REQUIRE_NO_FAIL(*actual);
+		REQUIRE_NO_FAIL(*expected);
+		NativeCompare(*actual, *expected);
+	}
+}
+
+TEST_CASE("Native oracle handles repeated subplans or rejects their mappings explicitly", "[native_row_oracle]") {
+	auto database = TestCreatePath("native_repeated_subplans.duckdb");
+	auto profile = TestCreatePath("native_repeated_subplans.json");
+	DeleteDatabase(database);
+	{
+		DuckDB writable(database);
+		Connection create(writable);
+		REQUIRE_NO_FAIL(create.Query("CREATE TABLE a(s INTEGER); CREATE TABLE b(s INTEGER); "
+		                             "INSERT INTO a VALUES (1),(1),(2),(NULL); "
+		                             "INSERT INTO b VALUES (1),(1),(2),(NULL); CHECKPOINT"));
+	}
+	DBConfig config;
+	config.options.access_mode = AccessMode::READ_ONLY;
+	DuckDB db(database, &config);
+	Connection con(db), counter(db);
+	vector<string> queries {"SELECT x.s,y.s FROM (SELECT a.s FROM a,b WHERE a.s=b.s) x, "
+	                        "(SELECT a.s FROM a,b WHERE a.s=b.s) y WHERE x.s=y.s",
+	                        "WITH ab AS MATERIALIZED (SELECT a.s FROM a,b WHERE a.s=b.s) "
+	                        "SELECT x.s,y.s FROM ab x,ab y WHERE x.s=y.s"};
+	for (auto &query : queries) {
+		auto expected = counter.Query(query);
+		REQUIRE_NO_FAIL(*expected);
+		// The two subplans each produce four key-1 rows and one key-2 row.
+		REQUIRE(expected->RowCount() == 17);
+		REQUIRE_NO_FAIL(con.Query("RESET optimizer_statistics_file; SET optimizer_statistics_mode='estimated'; "
+		                          "SET optimizer_statistics_discovery=true"));
+		auto discovered = con.Prepare(query);
+		if (discovered->HasError()) {
+			// Unsupported derived bindings/CTEs must fail in discovery too;
+			// they cannot silently enter a strict experiment with estimates.
+			REQUIRE(discovered->GetError().find("Native row oracle:") != string::npos);
+			REQUIRE(!ClientConfig::GetConfig(*con.context).native_oracle_active);
+			REQUIRE_NO_FAIL(
+			    con.Query("SET optimizer_statistics_discovery=false; SET optimizer_statistics_mode='oracle'"));
+			REQUIRE(con.Prepare(query)->HasError());
+		} else {
+			REQUIRE(discovered->Execute()->HasError());
+			SealResultDBOracle(con, counter, database, profile, {query}, false, {"Plain"});
+			auto strict = con.Prepare(query);
+			INFO((strict->HasError() ? strict->GetError() : query));
+			REQUIRE(!strict->HasError());
+			REQUIRE(strict->data->properties.native_row_oracle->missing == 0);
+			auto actual = strict->Execute();
+			REQUIRE_NO_FAIL(*actual);
+			NativeCompare(*actual, *expected);
+		}
+	}
+}
+
 TEST_CASE("ResultDB heuristic root uses Mutable index ties without cardinality inputs", "[native_row_oracle]") {
 	DuckDB db(nullptr);
 	Connection con(db), counter(db);
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE a(k INTEGER); INSERT INTO a VALUES (1),(1),(2),(NULL); "
 	                          "CREATE TABLE b(k BIGINT); INSERT INTO b VALUES (1),(2),(NULL); "
 	                          "CREATE TABLE c(k INTEGER); INSERT INTO c VALUES (1)"));
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_optimizer='paper'; SET resultdb_strategy='semijoin'"));
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='semijoin'"));
 	vector<string> queries {
 	    "SELECT RESULTDB x.k,z.k FROM a x,b y,c z WHERE CAST(x.k AS BIGINT)=y.k AND y.k=z.k",
 	    "SELECT RESULTDB x.k,z.k FROM c z,b y,a x WHERE CAST(x.k AS BIGINT)=y.k AND y.k=z.k",
@@ -283,7 +503,7 @@ TEST_CASE("Heuristic folds use Mutable index ties instead of smaller oracle inpu
 		                  " WHERE a.s=b.s AND a.d=c.s AND b.d=c.d AND c.d=d.s AND d.s=e.s "
 		                  "AND d.d=f.s AND e.d=f.d");
 	}
-	REQUIRE_NO_FAIL(con.Query("SET resultdb_optimizer='paper'; SET resultdb_strategy='semijoin'"));
+	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='semijoin'"));
 	// Reference choices for the two triangles linked by c-d. The first query
 	// must take a despite its six rows versus b's one; reordering FROM changes
 	// the first-index choice, while merging a leading d must retain its rank.

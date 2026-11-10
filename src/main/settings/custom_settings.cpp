@@ -1616,14 +1616,6 @@ Value OptimizerStatisticsFileSetting::GetSetting(const ClientContext &context) {
  return Value(ClientConfig::GetConfig(context).native_oracle_path);
 }
 
-void ResultdbOptimizerSetting::OnSet(SettingCallbackInfo &, Value &input) {
-	auto value = StringUtil::Lower(input.GetValue<string>());
-	if (value != "legacy" && value != "paper") {
-		throw InvalidInputException("resultdb_optimizer must be legacy or paper");
-	}
-	input = Value(value);
-}
-
 static void ValidateResultDBWeight(Value &input) {
 	auto value = input.GetValue<double>();
 	if (!std::isfinite(value) || value <= 0) {
