@@ -854,11 +854,7 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	config.native_oracle_active.reset();
 	if (statement_type == StatementType::SELECT_STATEMENT &&
 	    (result->properties.native_statistics_mode == "oracle" || discovery)) {
-		auto &resultdb = result->properties.resultdb;
-		bool paper_direct = resultdb.enabled && ResultDBStrategyIsEnumerated(resultdb.requested_strategy);
-		if (!logical_plan || result->properties.parameter_count || !config.enable_optimizer ||
-		    (resultdb.enabled && resultdb.requested_strategy != ResultDBStrategy::DECOMPOSE &&
-		     resultdb.requested_strategy != ResultDBStrategy::SEMIJOIN && !paper_direct)) {
+		if (!logical_plan || result->properties.parameter_count || !config.enable_optimizer) {
 			throw InvalidInputException("Native row oracle requires parameter-free native plain/decompose or supported direct ResultDB SELECT planning");
 		}
 		result->properties.native_row_oracle = make_shared_ptr<NativeRowOracle>(
