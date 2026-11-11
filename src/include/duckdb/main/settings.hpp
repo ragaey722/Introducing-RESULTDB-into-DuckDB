@@ -1666,6 +1666,17 @@ struct ResultdbEnumerationLimitSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct ResultdbOptimizeInternalPlansSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "resultdb_optimize_internal_plans";
+	static constexpr const char *Description = "Run the additional logical optimization pass on internal ResultDB "
+	                                           "relation and fold plans (experimental ablation switch)";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct ResultdbStrategySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "resultdb_strategy";

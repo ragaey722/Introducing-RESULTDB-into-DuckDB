@@ -155,6 +155,12 @@ static idx_t ProfiledFiveRowFold(ProfilingNode &node) {
 }
 
 TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "[native_row_oracle][internal_oracle]") {
+	bool optimize_internal = true;
+	SECTION("Additional internal optimization enabled") {
+	}
+	SECTION("Additional internal optimization disabled") {
+		optimize_internal = false;
+	}
 	auto database = TestCreatePath("internal_resultdb_oracle.duckdb");
 	auto profile = TestCreatePath("internal_resultdb_oracle.json");
 	DeleteDatabase(database);
@@ -173,6 +179,9 @@ TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "
 	config.options.access_mode = AccessMode::READ_ONLY;
 	DuckDB db(database, &config);
 	Connection con(db), counter(db);
+	REQUIRE(Settings::Get<ResultdbOptimizeInternalPlansSetting>(*con.context));
+	REQUIRE_NO_FAIL(con.Query(string("SET resultdb_optimize_internal_plans=") +
+	                         (optimize_internal ? "true" : "false")));
 	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='join_filter_pushdown'"));
 	vector<string> queries {
 	    "SELECT RESULTDB x.s,x.p,y.s,z.s FROM a x,b y,c z WHERE CAST(x.s AS BIGINT)=y.s AND x.d=z.s AND y.d=z.d",
@@ -315,7 +324,7 @@ TEST_CASE("Internal ResultDB plans preserve fold bags and consume exact rows", "
 	NativeCompare(*tree_result, *tree_expected);
 	REQUIRE(working_distinct == 0);
 	REQUIRE(!required_fold_bag_key.empty());
-	REQUIRE(build_probe > 0);
+	REQUIRE((optimize_internal ? build_probe > 0 : build_probe == 0));
 	REQUIRE(final_physical > 0);
 	REQUIRE_NO_FAIL(con.Query("SET resultdb_strategy='semijoin'"));
 	auto saved = con.Prepare(queries[0]);

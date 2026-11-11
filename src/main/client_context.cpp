@@ -750,8 +750,11 @@ void PreparedResultDBYannakakisProgram::BuildReductionSchedule() {
 static unique_ptr<PhysicalPlan> PlanResultDBYannakakisPhase(ClientContext &context, Binder &binder,
 	                                                       unique_ptr<LogicalOperator> logical_plan, bool optimize,
 	                                                       bool preserve_join_order) {
-	// Each materialization phase is still planned through DuckDB's normal optimizer/physical planner.
-	if (optimize && logical_plan->RequireOptimizer()) {
+	// This additional optimizer invocation runs DuckDB's logical passes over the
+	// chosen relation/fold plans, including build/probe and runtime-filter passes.
+	// The ablation skips that invocation; native physical planning still runs.
+	const auto optimize_internal = optimize && Settings::Get<ResultdbOptimizeInternalPlansSetting>(context);
+	if (optimize_internal && logical_plan->RequireOptimizer()) {
 		auto resultdb_properties = binder.GetStatementProperties().resultdb;
 		binder.GetStatementProperties().resultdb.enabled = false;
 		binder.GetStatementProperties().resultdb.planning_phase = true;
@@ -768,6 +771,13 @@ static unique_ptr<PhysicalPlan> PlanResultDBYannakakisPhase(ClientContext &conte
 #ifdef DEBUG
 		logical_plan->Verify(context);
 #endif
+	} else if (optimize && !optimize_internal) {
+		// Normally the optimizer pins internal oracle counts before physical
+		// planning. Keep those estimates available when its passes are skipped.
+		auto oracle = ClientConfig::GetConfig(context).native_oracle_active;
+		if (oracle && oracle->IsInternal()) {
+			oracle->Refresh(*logical_plan, "physical_input_unoptimized");
+		}
 	}
 	PhysicalPlanGenerator physical_planner(context);
 	return physical_planner.Plan(std::move(logical_plan));

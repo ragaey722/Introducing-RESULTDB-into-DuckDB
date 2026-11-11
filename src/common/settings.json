@@ -1161,6 +1161,13 @@
         "default_value": "3000000"
     },
     {
+        "name": "resultdb_optimize_internal_plans",
+        "description": "Run the additional logical optimization pass on internal ResultDB relation and fold plans (experimental ablation switch)",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "default_value": "true"
+    },
+    {
         "name": "resultdb_strategy",
         "description": "ResultDB strategy (Plain, Decompose, TD_heuristic, TD_root, TD_fold, TD_fold_no_tvc, Auto); Plain uses ordinary SELECT",
         "type": "VARCHAR",
